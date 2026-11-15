@@ -74,6 +74,10 @@ mosaix --export sessions/session-123 out.png --scale 0.5 --crop   # stitch a sav
 Get the latest build for Windows (setup or portable zip), macOS (universal `.dmg`) or Linux
 (x86-64 `.tar.gz`) from [**Releases**](https://github.com/adamhlt/Mosaix/releases/latest).
 
+Mosaïx checks for a new release at startup and offers to update itself (Windows setup or portable,
+macOS app, Linux x86-64); anywhere else it links to the release page. Click the version at the
+bottom of the window to check again. Set `MOSAIX_NO_UPDATE_CHECK=1` to turn the startup check off.
+
 On macOS the app isn't notarized: the first time, right-click it and choose **Open**. It asks for
 the camera permission on first use.
 

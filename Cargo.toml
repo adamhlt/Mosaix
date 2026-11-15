@@ -16,8 +16,8 @@ required-features = ["ui"]
 
 [features]
 default = ["ui", "camera"]
-# Rune UI (disable to test the core logic only: --no-default-features)
-ui = ["dep:rune"]
+# Rune UI and the self-updater (disable to test the core logic only: --no-default-features)
+ui = ["dep:rune", "dep:ureq", "dep:sha2", "dep:zip", "dep:flate2", "dep:tar"]
 # nokhwa camera backend (Media Foundation on Windows)
 camera = ["dep:nokhwa"]
 
@@ -31,6 +31,12 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 nokhwa = { version = "0.10.11", features = ["input-native"], optional = true }
+# Updates: query GitHub releases, download the asset, check it, unpack it.
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"], optional = true }
+sha2 = { version = "0.10", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
 rune = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af", features = ["native-file-dialog"], optional = true }
 
 [profile.dev]

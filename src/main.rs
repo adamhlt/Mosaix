@@ -4,8 +4,10 @@
 //! `--camera <index> [--res WxH] [--yuyv]` skips the start menu.
 //! Headless export of a saved session: `--export <session_dir> <out.png|jpg|tif> [--scale 0.5]
 //! [--crop] [--no-refine]`.
-//! UI testing without any source: `--fake stabilize|move|lost|closing|down|finished|dialog`
+//! UI testing without any source: `--fake stabilize|move|lost|closing|down|finished|dialog|update`
 //! shows a frozen state.
+
+mod update;
 
 use mosaix::analysis::Report;
 use mosaix::camera::{Mode, PixelFormat, SourceSpec};
@@ -132,6 +134,10 @@ struct App {
     export_format: usize,
     /// Session folder whose export options are being chosen (the options window is open).
     export_dialog: Option<PathBuf>,
+    /// Checks GitHub for a newer release and installs it.
+    updater: update::Updater,
+    /// "Up to date" or a failed manual check, shown in the update bar until dismissed.
+    update_note: Option<String>,
     initial: Option<SourceSpec>,
     fps_frames: u32,
     fps_t0: f64,
@@ -202,6 +208,12 @@ fn apply_fake(app: &mut App, kind: &str) {
         rows_done: 1,
         finished,
     });
+    if kind == "update" {
+        let version = "9.9.0".to_string();
+        let asset = update::Asset { name: "mosaix-windows-x64-portable.zip".into(), url: String::new(), size: 0, sha256: None };
+        let release = update::Release { tag: format!("v{version}"), version, assets: vec![asset.clone()] };
+        app.updater.state = update::State::Available(update::Offer { release, method: update::Method::Portable, asset: Some(asset) });
+    }
     if kind == "dialog" {
         app.export_dialog = Some(PathBuf::from("sessions/session-1794758298"));
     }
@@ -237,6 +249,8 @@ fn state() -> App {
         export_scale: 0,
         export_format: 0,
         export_dialog: None,
+        updater: update::Updater::new(),
+        update_note: None,
         initial: spec,
         fps_frames: 0,
         fps_t0: 0.0,
@@ -267,9 +281,12 @@ fn state() -> App {
 /// Starts the camera enumeration in the background and, if a CLI source was given, the pipeline.
 fn setup(s: &mut App, waker: Waker) {
     s.waker = Some(waker.clone());
-    if rune::extra_args().iter().any(|a| a == "--fake-menu") {
-        return;
+    s.updater.set_waker(waker.clone());
+    if rune::extra_args().iter().any(|a| a == "--fake-menu" || a == "--fake") {
+        return; // frozen states for visual testing: no camera, no network
     }
+    update::cleanup();
+    s.updater.check(false);
     let cams = s.cams.clone();
     std::thread::spawn(move || {
         #[cfg(feature = "camera")]
@@ -368,7 +385,7 @@ fn back_to_menu(s: &mut App) {
 }
 
 /// Drains messages from the analysis thread; `true` when the view must be rebuilt.
-fn poll(s: &mut App, clock: f64, _: &mut Tx) -> bool {
+fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     let mut dirty = s.screen == Screen::Menu; // camera list may have changed
     if s.menu.cam.is_none() {
         let first = match s.cams.lock() {
@@ -406,6 +423,12 @@ fn poll(s: &mut App, clock: f64, _: &mut Tx) -> bool {
             Err(e) => (e, false),
         });
         s.export = None;
+    }
+    if s.updater.poll(tx) {
+        dirty = true;
+    }
+    if let Some(note) = s.updater.notice.take() {
+        s.update_note = Some(note);
     }
     let Some(p) = &s.pipeline else { return dirty };
     while let Ok(ev) = p.events.try_recv() {
@@ -860,7 +883,7 @@ fn menu_view(s: &App) -> El {
     if let Some(e) = &s.menu.error {
         panel = panel.child(text(e.clone()).font(type_::BODY).color(red()));
     }
-    col().w_full().h_full().center().fill(t.bg).child(panel)
+    col().w_full().h_full().center().gap(12.0).fill(t.bg).child(panel).child(el().w(520.0).child(version_link()))
 } // ---------------------------------------------------------------- running view
 fn state_color(st: CaptureState) -> Color {
     match st {
@@ -1120,16 +1143,94 @@ fn running_view(s: &App) -> El {
                     .child(button("pause".into(), if s.paused { "Resume".into() } else { "Pause".into() }, toggle_pause))
                     .child(button("undo".into(), "Undo last tile".into(), undo)),
             )
-            .child(button("menu".into(), "Change source".into(), back_to_menu)),
+            .child(button("menu".into(), "Change source".into(), back_to_menu))
+            .child(version_link()),
     );
 
     row().w_full().h_full().gap(12.0).padding(12.0).fill(t.bg).child(live).child(panel)
+}
+
+// ---------------------------------------------------------------- updates
+/// The version, pressed to look for a newer release.
+fn version_link() -> El {
+    row()
+        .key("version".to_string())
+        .role("button")
+        .label("Check for updates".to_string())
+        .focusable(true)
+        .w_full()
+        .center()
+        .on_press(|s: &mut App| {
+            s.update_note = None;
+            s.updater.check(true);
+        })
+        .child(text(format!("Mosaïx {} · check for updates", update::VERSION)).font(type_::BODY).color(dim()))
+}
+
+/// A bar across the top when a newer release exists (or after a manual check), with what can
+/// be done about it.
+fn update_banner(s: &App) -> Option<El> {
+    use update::State;
+    let open_page = |s: &mut App| {
+        if let Some(url) = s.updater.page() {
+            update::open_url(&url);
+        }
+    };
+    let close = |key: &str| {
+        button(key.to_string(), "Dismiss".into(), |s: &mut App| {
+            s.updater.dismiss();
+            s.update_note = None;
+        })
+    };
+    let (message, buttons): (String, Vec<El>) = match (&s.update_note, &s.updater.state) {
+        (Some(note), State::Idle | State::Checking) => (note.clone(), vec![close("update-close")]),
+        (_, State::Available(o)) if o.can_install() => (
+            format!("Mosaïx {} is available (you have {}).", o.release.version, update::VERSION),
+            vec![
+                primary("update-install", "Update now", |s: &mut App| s.updater.install()),
+                button("update-page".into(), "Release page".into(), open_page),
+                close("update-close"),
+            ],
+        ),
+        (_, State::Available(o)) => (
+            format!("Mosaïx {} is available (you have {}). Download it from its release page.", o.release.version, update::VERSION),
+            vec![primary("update-page", "Open release page", open_page), close("update-close")],
+        ),
+        (_, State::Downloading { offer, done, total }) => {
+            let pct = if *total > 0 { format!(" {} %", (done * 100 / total).min(100)) } else { String::new() };
+            (format!("Downloading Mosaïx {}…{pct}", offer.release.version), Vec::new())
+        }
+        (_, State::Installing(offer)) => (format!("Installing Mosaïx {}… the app restarts by itself.", offer.release.version), Vec::new()),
+        (_, State::Failed { offer, message }) => (
+            format!("Couldn't update to Mosaïx {}: {message}", offer.release.version),
+            vec![primary("update-page", "Open release page", open_page), close("update-close")],
+        ),
+        (None, State::Idle | State::Checking) => return None,
+    };
+    Some(
+        row()
+            .key("update-banner".to_string())
+            .w_full()
+            .gap(8.0)
+            .padding(8.0)
+            .items_center()
+            .radius(10.0)
+            .fill(card())
+            .child(el().grow(1.0).min_w(0.0).child(text(message).font(type_::BODY).color(Color::WHITE).truncate()))
+            .children(buttons),
+    )
 }
 
 fn view(s: &App, _: &mut Cx<App>) -> El {
     let main = match s.screen {
         Screen::Menu => menu_view(s),
         Screen::Running => running_view(s),
+    };
+    let main = match update_banner(s) {
+        Some(bar) => {
+            col().w_full().h_full().child(el().w_full().padding(12.0).pb(0.0).child(bar)).child(el().w_full().grow(1.0).child(main))
+        }
+        None => main,
     };
     match &s.export_dialog {
         Some(dir) => el().w_full().h_full().child(main).child(export_dialog_view(s, dir)),

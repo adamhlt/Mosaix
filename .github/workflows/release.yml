@@ -57,11 +57,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libclang-dev
 
-      # The version shown by the installer and the macOS app: the tag (`v1.2` or `1.2`), else Cargo.toml's.
+      # The release's version is its tag (`v1.2` or `1.2`): the app reports it, and compares it
+      # with the latest release to offer updates, so it must not stay at Cargo.toml's.
       - name: Version
         shell: bash
         run: |
-          if [ -n "$TAG" ]; then VERSION="${TAG#v}"; else VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2); fi
+          if [ -n "$TAG" ]; then
+            # Code from before the version came from the tag would quietly report Cargo.toml's.
+            if ! grep -q MOSAIX_VERSION src/update.rs; then
+              echo "::error::$TAG points at code that can't take its version from the tag: move the tag to a newer commit (git tag -f $TAG <commit> && git push -f origin $TAG)."
+              exit 1
+            fi
+            VERSION="${TAG#v}"
+            echo "MOSAIX_VERSION=$VERSION" >> "$GITHUB_ENV"
+          else
+            VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@v2

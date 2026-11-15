@@ -1,17 +1,25 @@
-//! Mosaic export: global alignment, brightness matching, multiband blending, writing.
+//! Mosaic export: global alignment, colour and focus models, multiband blending, writing.
 //!
 //! The blending follows the approach of Layr's stitcher (itself after OpenPano / Brown & Lowe):
-//! every output pixel belongs to the tile it sits most centrally in, fine detail comes from that
-//! tile alone (no ghosting), and coarser bands are mixed over wider strips around the seams
-//! (Burt & Adelson). Brightness is matched between neighbours by least squares. The output is
-//! processed in square blocks with a margin wide enough for the coarsest band, so memory stays
-//! bounded whatever the mosaic's size.
+//! every output pixel belongs to one tile, fine detail comes from that tile alone (no ghosting),
+//! and coarser bands are mixed over wider strips around the seams (Burt & Adelson). The owner of a
+//! pixel is the tile it sits most centrally *and sharply* in: the focal plane of a microscope is
+//! rarely parallel to the board, and the seams move toward the sharp side of every overlap. The
+//! output is processed in square blocks with a margin wide enough for the coarsest band, so memory
+//! stays bounded whatever the mosaic's size.
 //!
-//! Unlike photos taken from different angles, our tiles only differ by a translation, which the
-//! live tracker already estimated. Here that estimate is refined: phase correlation between
-//! every pair of overlapping tiles gives relative offsets, and a least-squares solve removes the
-//! drift accumulated along the scan.
+//! Tiles are taken from the same point of view, so they mostly differ by a translation, which the
+//! live tracker already estimated. Here that estimate is refined: whole-tile registration, then
+//! phase correlation between every pair of overlapping tiles and a least-squares solve that
+//! removes the drift accumulated along the scan. A board moved by hand also turns a little, so a
+//! last pass fits a small rotation per tile to point matches over all overlaps ([`crate::align`]).
+//!
+//! Colour: the light of a microscope is uneven (vignetting, a lamp on one side) and the camera's
+//! exposure and white balance drift. Both are fitted from the overlaps at once, per channel — a
+//! smooth field of the frame plus a factor per tile ([`crate::photometry`]) — and divided out.
 
+use crate::align::{solve_poses, PointMatch, Pose};
+use crate::photometry::{self, FieldSample, FrameField};
 use crate::session::{Session, TileMeta};
 use crate::tracking::{gray_small, to_f32, PhaseCorrelator};
 use anyhow::{bail, Context, Result};
@@ -296,45 +304,12 @@ pub fn refine_positions(p0: &[(f64, f64)], pairs: &[PairMeasure], prior: f64) ->
     xs.into_iter().zip(ys).collect()
 }
 
-/// Mean brightness of an overlap, seen from tile `i` and from tile `j`.
-#[derive(Debug, Clone, Copy)]
-pub struct PairStat {
-    pub i: usize,
-    pub j: usize,
-    pub mi: f64,
-    pub mj: f64,
-    /// Overlap area, in megapixels.
-    pub n: f64,
-}
-
-/// A gain per tile so that neighbours look equally bright where they overlap
-/// (Brown & Lowe's gain compensation).
-pub fn compute_gains(n: usize, stats: &[PairStat]) -> Vec<f64> {
-    const SIGMA_N2: f64 = 100.0; // (10 gray levels)²
-    const INV_SIGMA_G2: f64 = 25.0; // (0.2)⁻²: a gentle pull toward unit gain
-    let mut b = vec![0.0; n];
-    for s in stats {
-        b[s.i] += s.n * INV_SIGMA_G2;
-        b[s.j] += s.n * INV_SIGMA_G2;
-    }
-    let apply = |x: &[f64], y: &mut [f64]| {
-        y.iter_mut().for_each(|v| *v = 0.0);
-        for s in stats {
-            let cross = 2.0 * s.n * s.mi * s.mj / SIGMA_N2;
-            y[s.i] += (2.0 * s.n * s.mi * s.mi / SIGMA_N2 + s.n * INV_SIGMA_G2) * x[s.i] - cross * x[s.j];
-            y[s.j] += (2.0 * s.n * s.mj * s.mj / SIGMA_N2 + s.n * INV_SIGMA_G2) * x[s.j] - cross * x[s.i];
-        }
-    };
-    let g = cg(&apply, &b, &vec![1.0; n], 500);
-    g.into_iter().map(|v| v.clamp(0.7, 1.4)).collect()
-}
-
 /// Integer placement of a tile.
 fn rounded(p: (f64, f64)) -> (i64, i64) {
     (p.0.round() as i64, p.1.round() as i64)
 }
 
-/// Measures the overlap of tiles `i` and `j`: a phase-correlation offset and brightness stats.
+/// Measures the overlap of tiles `i` and `j`: a phase-correlation offset.
 fn measure_pair(
     set: &TileSet,
     i: usize,
@@ -342,7 +317,7 @@ fn measure_pair(
     p: &[(f64, f64)],
     pcs: &mut HashMap<(usize, usize), PhaseCorrelator>,
     fine_side: f64,
-) -> Result<(Option<PairMeasure>, Option<PairStat>)> {
+) -> Result<Option<PairMeasure>> {
     let (xi, yi) = rounded(p[i]);
     let (xj, yj) = rounded(p[j]);
     let (wi, hi) = (set.meta[i].width as i64, set.meta[i].height as i64);
@@ -351,7 +326,7 @@ fn measure_pair(
     let (y0, y1) = (yi.max(yj), (yi + hi).min(yj + hj));
     let (ow, oh) = (x1 - x0, y1 - y0);
     if ow < 48 || oh < 48 || (ow * oh) as f64 / ((wi * hi).min(wj * hj) as f64) < 0.08 {
-        return Ok((None, None));
+        return Ok(None);
     }
     let (ti, tj) = (set.load(i)?, set.load(j)?);
     let a = imageops::crop_imm(&*ti, (x0 - xi) as u32, (y0 - yi) as u32, ow as u32, oh as u32).to_image();
@@ -359,26 +334,24 @@ fn measure_pair(
     let k = (ow.max(oh) as f64 / fine_side).ceil().max(1.0) as u32;
     let (ga, gb): (GrayImage, GrayImage) = (gray_small(&a, k), gray_small(&b, k));
     let (fa, fb) = (to_f32(&ga), to_f32(&gb));
-    let mean = |v: &[f32]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len().max(1) as f64;
-    let stat = PairStat { i, j, mi: mean(&fa), mj: mean(&fb), n: (ow * oh) as f64 / 1e6 };
 
     let key = (ga.width() as usize, ga.height() as usize);
     let pc = pcs.entry(key).or_insert_with(|| PhaseCorrelator::new(key.0, key.1));
     let s = pc.correlate(&fa, &fb);
     if !s.is_reliable() {
-        return Ok((None, Some(stat)));
+        return Ok(None);
     }
     // b(x) ≈ a(x - d) with d = e_i - e_j  ⇒  wanted p_j - p_i = (rounded p_j - p_i) - d
     let (dx, dy) = (s.dx * k as f64, s.dy * k as f64);
     // A tile pair cannot be off by more than a fraction of the field: reject wild measurements.
     let limit = 0.25 * (wi.min(hi).min(wj).min(hj)) as f64;
     if dx.abs() > limit || dy.abs() > limit {
-        return Ok((None, Some(stat)));
+        return Ok(None);
     }
     let area = (ow * oh) as f64 / ((wi * hi).min(wj * hj) as f64);
     let w = (s.peak as f64).clamp(0.05, 1.0).powi(2) * area.sqrt();
     let t = ((xj - xi) as f64 - dx, (yj - yi) as f64 - dy);
-    Ok((Some(PairMeasure { i, j, t, w }), Some(stat)))
+    Ok(Some(PairMeasure { i, j, t, w }))
 }
 
 /// Pairs of tiles whose rectangles overlap enough to be measured.
@@ -418,6 +391,268 @@ struct Small {
     /// Reduction factor relative to the capture resolution.
     k: u32,
     px: Vec<f32>,
+    /// `px` slightly blurred, for [`patch_score`]: part of the field is often out of focus (a
+    /// tilted board or focal plane), and a sharp patch never correlates well with its blurred
+    /// twin. Blurring both sides first compares what they still have in common.
+    soft: Vec<f32>,
+}
+
+impl Small {
+    fn new(gray: &GrayImage, k: u32) -> Self {
+        let (w, h) = (gray.width() as usize, gray.height() as usize);
+        let px = to_f32(gray);
+        let soft = gaussian_blur(&px, w, h, SOFT_SIGMA / k as f32);
+        Small { w, h, k, px, soft }
+    }
+}
+
+/// Blur applied before scoring patches, in capture px.
+const SOFT_SIGMA: f32 = 4.0;
+
+/// Separable Gaussian blur of a `w × h` plane (edges clamped).
+fn gaussian_blur(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+    if sigma < 0.3 || w == 0 || h == 0 {
+        return src.to_vec();
+    }
+    let r = (3.0 * sigma).ceil() as i64;
+    let mut k: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let s: f32 = k.iter().sum();
+    k.iter_mut().for_each(|v| *v /= s);
+    let mut tmp = vec![0f32; w * h];
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        for x in 0..w {
+            let mut acc = 0.0;
+            for (t, kv) in k.iter().enumerate() {
+                acc += kv * row[(x as i64 + t as i64 - r).clamp(0, w as i64 - 1) as usize];
+            }
+            tmp[y * w + x] = acc;
+        }
+    }
+    let mut out = vec![0f32; w * h];
+    for y in 0..h {
+        for (t, kv) in k.iter().enumerate() {
+            let sy = (y as i64 + t as i64 - r).clamp(0, h as i64 - 1) as usize;
+            let (o, s) = (&mut out[y * w..(y + 1) * w], &tmp[sy * w..(sy + 1) * w]);
+            for x in 0..w {
+                o[x] += kv * s[x];
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------- photometry and focus
+
+/// Cell size (capture px) of the grids used to fit the photometric and focus fields.
+const GRID: u32 = 16;
+
+/// Low-resolution views of a tile for the frame-field fits, one value per `GRID` px cell.
+struct Grids {
+    w: usize,
+    h: usize,
+    /// Mean colour of each cell.
+    rgb: [Vec<f32>; 3],
+    /// Mean squared gradient (gray levels²) and mean gray level of each cell, from the 1/2 view.
+    energy: Vec<f32>,
+    gray: Vec<f32>,
+}
+
+impl Grids {
+    fn new(img: &RgbImage, small: &Small) -> Self {
+        let (w, h) = ((img.width() / GRID) as usize, (img.height() / GRID) as usize);
+        let mut rgb = [vec![0f32; w * h], vec![0f32; w * h], vec![0f32; w * h]];
+        let raw = img.as_raw();
+        let stride = img.width() as usize * 3;
+        let g = GRID as usize;
+        for cy in 0..h {
+            for cx in 0..w {
+                let mut s = [0u32; 3];
+                for y in cy * g..(cy + 1) * g {
+                    let row = &raw[y * stride + cx * g * 3..y * stride + (cx + 1) * g * 3];
+                    for p in row.chunks_exact(3) {
+                        s[0] += p[0] as u32;
+                        s[1] += p[1] as u32;
+                        s[2] += p[2] as u32;
+                    }
+                }
+                for c in 0..3 {
+                    rgb[c][cy * w + cx] = s[c] as f32 / (g * g) as f32;
+                }
+            }
+        }
+        // gradient energy on the 1/k view, accumulated per cell
+        let (mut energy, mut gray) = (vec![0f32; w * h], vec![0f32; w * h]);
+        let c = (GRID / small.k).max(1) as usize;
+        for cy in 0..h {
+            for cx in 0..w {
+                let (mut e, mut m, mut cnt) = (0f32, 0f32, 0f32);
+                for y in (cy * c).max(1)..((cy + 1) * c).min(small.h - 1) {
+                    for x in (cx * c).max(1)..((cx + 1) * c).min(small.w - 1) {
+                        let p = &small.px;
+                        let gx = p[y * small.w + x + 1] - p[y * small.w + x - 1];
+                        let gy = p[(y + 1) * small.w + x] - p[(y - 1) * small.w + x];
+                        e += 0.25 * (gx * gx + gy * gy);
+                        m += p[y * small.w + x];
+                        cnt += 1.0;
+                    }
+                }
+                if cnt > 0.0 {
+                    energy[cy * w + cx] = e / cnt;
+                    gray[cy * w + cx] = m / cnt;
+                }
+            }
+        }
+        Grids { w, h, rgb, energy, gray }
+    }
+}
+
+/// Bilinear sample of a `w × h` plane at continuous cell coordinates.
+fn bilerp(p: &[f32], w: usize, x: f64, y: f64) -> f32 {
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (tx, ty) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
+    let a = p[y0 * w + x0] * (1.0 - tx) + p[y0 * w + x0 + 1] * tx;
+    let b = p[(y0 + 1) * w + x0] * (1.0 - tx) + p[(y0 + 1) * w + x0 + 1] * tx;
+    a * (1.0 - ty) + b * ty
+}
+
+/// For every overlapping pair, every grid cell of tile `i` seen in tile `j` too:
+/// `f(i, j, cell of i, (x, y) in j's cells, (u_i, v_i), (u_j, v_j))`. At most `per_pair` cells
+/// per pair (evenly strided).
+fn for_overlap_cells(
+    grids: &[Option<Grids>],
+    meta: &[TileMeta],
+    poses: &[Pose],
+    pairs: &[(usize, usize)],
+    per_pair: usize,
+    mut f: impl FnMut(usize, usize, usize, (f64, f64), (f64, f64), (f64, f64)),
+) {
+    for &(i, j) in pairs {
+        let (Some(a), Some(b)) = (&grids[i], &grids[j]) else { continue };
+        if a.w != b.w || a.h != b.h || a.w < 4 || a.h < 4 {
+            continue;
+        }
+        let (w, h) = (a.w, a.h);
+        let g = GRID as f64;
+        let (hi, hj) = ((meta[i].width as f64 / 2.0, meta[i].height as f64 / 2.0), (meta[j].width as f64 / 2.0, meta[j].height as f64 / 2.0));
+        let uv = |x: f64, y: f64| (2.0 * (x + 0.5) / w as f64 - 1.0, 2.0 * (y + 0.5) / h as f64 - 1.0);
+        let mut cells = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let board = poses[i].apply(((x as f64 + 0.5) * g - hi.0, (y as f64 + 0.5) * g - hi.1));
+                let pj = poses[j].invert(board);
+                let (xj, yj) = ((pj.0 + hj.0) / g - 0.5, (pj.1 + hj.1) / g - 0.5);
+                if xj >= 0.0 && yj >= 0.0 && xj < (w - 1) as f64 && yj < (h - 1) as f64 {
+                    cells.push((x, y, xj, yj));
+                }
+            }
+        }
+        let step = (cells.len() / per_pair.max(1)).max(1);
+        for &(x, y, xj, yj) in cells.iter().step_by(step) {
+            f(i, j, y * w + x, (xj, yj), uv(x as f64, y as f64), uv(xj, yj));
+        }
+    }
+}
+
+/// Colour model: one [`FrameField`] per channel (`ln value = tile + frame + ln truth`).
+fn fit_colour(grids: &[Option<Grids>], meta: &[TileMeta], poses: &[Pose], pairs: &[(usize, usize)]) -> [FrameField; 3] {
+    let n = grids.len();
+    let mut samples: [Vec<FieldSample>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for_overlap_cells(grids, meta, poses, pairs, 3000, |i, j, ci, (xj, yj), pi, pj| {
+        let (Some(a), Some(b)) = (&grids[i], &grids[j]) else { return };
+        let va: [f32; 3] = [a.rgb[0][ci], a.rgb[1][ci], a.rgb[2][ci]];
+        let vb: [f32; 3] = [0, 1, 2].map(|c| bilerp(&b.rgb[c], b.w, xj, yj));
+        // clipped or nearly black cells say nothing about the gain
+        if va.iter().chain(&vb).any(|&v| !(12.0..=243.0).contains(&v)) {
+            return;
+        }
+        for c in 0..3 {
+            // the log of a dark value is mostly noise: trust a sample in proportion to its signal
+            let weight = (va[c].min(vb[c]) / 64.0).min(1.0);
+            samples[c].push(FieldSample { weight: weight * weight, ..FieldSample::new(i, j, pi, pj, (va[c] as f64).ln() - (vb[c] as f64).ln()) });
+        }
+    });
+    samples.map(|s| photometry::fit(n, &s, COLOUR_TILE_PRIOR, FRAME_PRIOR))
+}
+
+/// Focus model: `ln (gradient energy / brightness²) = tile + frame + ln content`. The frame part
+/// maps where the optics are sharp; the tile part catches a tile blurred by motion.
+fn fit_focus(grids: &[Option<Grids>], meta: &[TileMeta], poses: &[Pose], pairs: &[(usize, usize)]) -> FrameField {
+    let n = grids.len();
+    let mut samples = Vec::new();
+    for_overlap_cells(grids, meta, poses, pairs, 3000, |i, j, ci, (xj, yj), pi, pj| {
+        let (Some(a), Some(b)) = (&grids[i], &grids[j]) else { return };
+        let (ea, eb) = (a.energy[ci], bilerp(&b.energy, b.w, xj, yj));
+        let (ma, mb) = (a.gray[ci], bilerp(&b.gray, b.w, xj, yj));
+        // flat areas carry only noise; clipped ones lose their gradients
+        if ea.max(eb) < 25.0 || ea.min(eb) <= 0.5 || !(8.0..=245.0).contains(&ma) || !(8.0..=245.0).contains(&mb) {
+            return;
+        }
+        let y = ((ea / (ma * ma)) as f64).ln() - ((eb / (mb * mb)) as f64).ln();
+        samples.push(FieldSample::new(i, j, pi, pj, y));
+    });
+    photometry::fit(n, &samples, FOCUS_TILE_PRIOR, FRAME_PRIOR)
+}
+
+/// Pull of the per-tile colour terms toward each other (see [`photometry::fit`]).
+const COLOUR_TILE_PRIOR: f64 = 0.1;
+const FOCUS_TILE_PRIOR: f64 = 0.1;
+/// Pull of the frame polynomials toward flat (see [`photometry::fit`]).
+const FRAME_PRIOR: f64 = 2e-3;
+/// How much sharpness moves the seams: the owner of a pixel maximises `centrality · sharpness^γ`.
+const FOCUS_GAMMA: f64 = 0.5;
+
+/// Per-pixel maps of the frame at the export scale, shared by every tile of that size.
+struct FrameMaps {
+    /// Colour correction factor per channel (vignetting / uneven lighting removed).
+    gain: [Vec<f32>; 3],
+    /// Seam priority: centrality in the tile times relative sharpness.
+    quality: Vec<f32>,
+}
+
+fn frame_maps(w: usize, h: usize, colour: Option<&[FrameField; 3]>, focus: Option<&FrameField>) -> FrameMaps {
+    let mut gain = [vec![1f32; w * h], vec![1f32; w * h], vec![1f32; w * h]];
+    let mut quality = vec![0f32; w * h];
+    // fields are smooth: evaluate on a coarse lattice, interpolate bilinearly
+    let (lw, lh) = (65usize, 37usize);
+    let lattice = |f: &dyn Fn(f64, f64) -> f64| -> Vec<f32> {
+        let mut v = vec![0f32; lw * lh];
+        for y in 0..lh {
+            for x in 0..lw {
+                v[y * lw + x] = f(2.0 * x as f64 / (lw - 1) as f64 - 1.0, 2.0 * y as f64 / (lh - 1) as f64 - 1.0) as f32;
+            }
+        }
+        v
+    };
+    let sample = |lat: &[f32], x: usize, y: usize| -> f32 {
+        let u = ((x as f64 + 0.5) / w as f64 * (lw - 1) as f64).clamp(0.0, (lw - 1) as f64 - 1e-6);
+        let v = ((y as f64 + 0.5) / h as f64 * (lh - 1) as f64).clamp(0.0, (lh - 1) as f64 - 1e-6);
+        bilerp(lat, lw, u, v)
+    };
+    if let Some(cf) = colour {
+        for c in 0..3 {
+            let mean = cf[c].frame_mean();
+            let lat = lattice(&|u, v| (-(cf[c].frame(u, v) - mean)).exp().clamp(0.25, 4.0));
+            for y in 0..h {
+                for x in 0..w {
+                    gain[c][y * w + x] = sample(&lat, x, y);
+                }
+            }
+        }
+    }
+    let sharp = focus.map(|f| {
+        let mean = f.frame_mean();
+        lattice(&|u, v| (FOCUS_GAMMA * (f.frame(u, v) - mean).clamp(-6.0, 6.0)).exp())
+    });
+    for y in 0..h {
+        let wy = 0.5 - (((y as f32 + 0.5) / h as f32) - 0.5).abs();
+        for x in 0..w {
+            let wx = 0.5 - (((x as f32 + 0.5) / w as f32) - 0.5).abs();
+            let s = sharp.as_ref().map_or(1.0, |lat| sample(lat, x, y));
+            quality[y * w + x] = wx * wy * s;
+        }
+    }
+    FrameMaps { gain, quality }
 }
 
 /// Pairs of tiles that may overlap according to the recorded positions, with a generous margin:
@@ -463,8 +698,8 @@ fn patch_score(a: &Small, b: &Small, dx: i64, dy: i64) -> Option<(f64, usize, f6
             for py in 0..PATCH {
                 let (ra, rb) = (((y + py - dy) * w) as usize, ((y + py) * w) as usize);
                 for px in 0..PATCH {
-                    let va = a.px[ra + (x + px - dx) as usize] as f64;
-                    let vb = b.px[rb + (x + px) as usize] as f64;
+                    let va = a.soft[ra + (x + px - dx) as usize] as f64;
+                    let vb = b.soft[rb + (x + px) as usize] as f64;
                     sa += va;
                     sb += vb;
                     saa += va * va;
@@ -566,55 +801,173 @@ fn coarse_pair(probe: &Probe, k: u32, recorded: (f64, f64), tile_min: f64) -> Op
     Some((t, probe.score * probe.score * probe.frac.sqrt()))
 }
 
-/// Mean absolute difference of `a` and `b` over their overlap at content shift `(dx, dy)`, after
-/// removing each side's mean (so a brightness offset does not count): `(error, overlap pixels)`.
-fn overlap_diff(a: &Small, b: &Small, dx: i64, dy: i64) -> Option<(f64, f64)> {
-    let (w, h) = (a.w as i64, a.h as i64);
-    let (x0, x1) = (dx.max(0), (w + dx).min(w));
-    let (y0, y1) = (dy.max(0), (h + dy).min(h));
-    if x1 - x0 < 16 || y1 - y0 < 16 {
-        return None;
-    }
-    let n = ((x1 - x0) * (y1 - y0)) as f64;
-    let (mut sa, mut sb) = (0.0f64, 0.0f64);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            sa += a.px[((y - dy) * w + x - dx) as usize] as f64;
-            sb += b.px[(y * w + x) as usize] as f64;
-        }
-    }
-    let off = (sb - sa) / n;
-    let mut err = 0.0f64;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            err += (b.px[(y * w + x) as usize] as f64 - a.px[((y - dy) * w + x - dx) as usize] as f64 - off).abs();
-        }
-    }
-    Some((err / n, n))
-}
-
-/// How well the final layout registers the tiles: overlap-weighted mean of [`overlap_diff`] over
-/// every pair that overlaps by at least 10 % of a tile.
-fn overlap_error(smalls: &[Option<Small>], positions: &[(f64, f64)]) -> Option<f64> {
+/// How well the final layout registers the tiles: overlap-weighted mean absolute difference of
+/// the reduced tiles where they overlap (each pair's mean offset removed, so brightness does not
+/// count), over every pair overlapping by at least 10 % of a tile.
+fn overlap_error(smalls: &[Option<Small>], meta: &[TileMeta], poses: &[Pose]) -> Option<f64> {
     let (mut sum, mut weight) = (0.0f64, 0.0f64);
-    for i in 0..smalls.len() {
-        for j in i + 1..smalls.len() {
-            let (Some(a), Some(b)) = (&smalls[i], &smalls[j]) else { continue };
-            if a.w != b.w || a.h != b.h {
-                continue;
-            }
-            let k = a.k as f64;
-            // b(x) ≈ a(x - d), d = -(p_j - p_i) / k
-            let d = (-(positions[j].0 - positions[i].0) / k, -(positions[j].1 - positions[i].1) / k);
-            if let Some((e, n)) = overlap_diff(a, b, d.0.round() as i64, d.1.round() as i64) {
-                if n >= 0.10 * (a.w * a.h) as f64 {
-                    sum += e * n;
-                    weight += n;
+    let positions: Vec<(f64, f64)> = poses.iter().zip(meta).map(|(p, m)| (p.cx - m.width as f64 / 2.0, p.cy - m.height as f64 / 2.0)).collect();
+    for (i, j) in overlapping_pairs(meta, &positions) {
+        let (Some(a), Some(b)) = (&smalls[i], &smalls[j]) else { continue };
+        let k = a.k as f64;
+        let (hi, hj) = ((meta[i].width as f64 / 2.0, meta[i].height as f64 / 2.0), (meta[j].width as f64 / 2.0, meta[j].height as f64 / 2.0));
+        let mut vals: Vec<(f32, f32)> = Vec::new();
+        for y in 0..b.h {
+            for x in 0..b.w {
+                let board = poses[j].apply(((x as f64 + 0.5) * k - hj.0, (y as f64 + 0.5) * k - hj.1));
+                let p = poses[i].invert(board);
+                let (xa, ya) = (((p.0 + hi.0) / k - 0.5).round(), ((p.1 + hi.1) / k - 0.5).round());
+                if xa >= 0.0 && ya >= 0.0 && (xa as usize) < a.w && (ya as usize) < a.h {
+                    vals.push((a.px[ya as usize * a.w + xa as usize], b.px[y * b.w + x]));
                 }
             }
         }
+        let cnt = vals.len() as f64;
+        if cnt < 0.10 * (b.w * b.h) as f64 {
+            continue;
+        }
+        let off = vals.iter().map(|(va, vb)| (vb - va) as f64).sum::<f64>() / cnt;
+        let err = vals.iter().map(|(va, vb)| ((vb - va) as f64 - off).abs()).sum::<f64>() / cnt;
+        sum += err * cnt;
+        weight += cnt;
     }
     (weight > 0.0).then(|| sum / weight)
+}
+
+/// Side (reduced px) of the patches matched by [`local_matches`], and the search radius.
+const MATCH_PATCH: usize = 32;
+const MATCH_RADIUS: i64 = 7;
+/// Most patches matched per tile pair (the most textured ones).
+const MATCH_PER_PAIR: usize = 96;
+const MATCH_MIN_NCC: f64 = 0.8;
+
+/// Point matches between overlapping tiles: patches of tile `i` searched in tile `j` around where
+/// the current poses put them (normalised cross-correlation on the softened views, sub-pixel by
+/// parabola). The result feeds [`solve_poses`].
+fn local_matches(smalls: &[Option<Small>], meta: &[TileMeta], poses: &[Pose], pairs: &[(usize, usize)]) -> Vec<PointMatch> {
+    let found: Mutex<Vec<PointMatch>> = Mutex::new(Vec::new());
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads().min(pairs.len().max(1)) {
+            s.spawn(|| loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                if idx >= pairs.len() {
+                    break;
+                }
+                let (i, j) = pairs[idx];
+                let (Some(a), Some(b)) = (&smalls[i], &smalls[j]) else { continue };
+                let local = match_pair(a, b, (i, j), meta, poses);
+                if let Ok(mut f) = found.lock() {
+                    f.extend(local);
+                }
+            });
+        }
+    });
+    found.into_inner().unwrap_or_default()
+}
+
+fn match_pair(a: &Small, b: &Small, (i, j): (usize, usize), meta: &[TileMeta], poses: &[Pose]) -> Vec<PointMatch> {
+    let (p, r) = (MATCH_PATCH as i64, MATCH_RADIUS);
+    let k = a.k as f64;
+    let (hi, hj) = ((meta[i].width as f64 / 2.0, meta[i].height as f64 / 2.0), (meta[j].width as f64 / 2.0, meta[j].height as f64 / 2.0));
+    // where a patch of `a` (top-left in reduced px) is expected in `b`
+    let predict = |x: i64, y: i64| -> (f64, f64) {
+        let c = ((x as f64 + p as f64 / 2.0) * k - hi.0, (y as f64 + p as f64 / 2.0) * k - hi.1);
+        let q = poses[j].invert(poses[i].apply(c));
+        ((q.0 + hj.0) / k - p as f64 / 2.0, (q.1 + hj.1) / k - p as f64 / 2.0)
+    };
+    let stats = |img: &[f32], w: usize, x: i64, y: i64| -> (f64, f64) {
+        let (mut s, mut ss) = (0.0f64, 0.0f64);
+        for py in 0..p {
+            let row = &img[(y + py) as usize * w + x as usize..][..p as usize];
+            for &v in row {
+                s += v as f64;
+                ss += (v as f64) * (v as f64);
+            }
+        }
+        let n = (p * p) as f64;
+        (s / n, (ss / n - (s / n).powi(2)).max(0.0))
+    };
+    // candidate patches: on a grid, inside both tiles with room for the search
+    let mut cand: Vec<(f64, i64, i64, i64, i64)> = Vec::new();
+    let step = (p * 3 / 4) as usize;
+    for y in (0..a.h as i64 - p).step_by(step) {
+        for x in (0..a.w as i64 - p).step_by(step) {
+            let (bx, by) = predict(x, y);
+            let (bx, by) = (bx.round() as i64, by.round() as i64);
+            if bx - r < 0 || by - r < 0 || bx + p + r > b.w as i64 || by + p + r > b.h as i64 {
+                continue;
+            }
+            let (_, var) = stats(&a.soft, a.w, x, y);
+            if var > 40.0 {
+                cand.push((var, x, y, bx, by));
+            }
+        }
+    }
+    cand.sort_by(|u, v| v.0.partial_cmp(&u.0).unwrap_or(std::cmp::Ordering::Equal));
+    cand.truncate(MATCH_PER_PAIR);
+    let mut out = Vec::new();
+    let side = (2 * r + 1) as usize;
+    for &(_, x, y, bx, by) in &cand {
+        let (ma, va) = stats(&a.soft, a.w, x, y);
+        let mut scores = vec![f64::MIN; side * side];
+        for oy in -r..=r {
+            for ox in -r..=r {
+                let (sx, sy) = (bx + ox, by + oy);
+                let (mb, vb) = stats(&b.soft, b.w, sx, sy);
+                if vb < 1.0 {
+                    continue;
+                }
+                let mut cross = 0.0f64;
+                for py in 0..p {
+                    let ra = &a.soft[(y + py) as usize * a.w + x as usize..][..p as usize];
+                    let rb = &b.soft[(sy + py) as usize * b.w + sx as usize..][..p as usize];
+                    for (u, v) in ra.iter().zip(rb) {
+                        cross += *u as f64 * *v as f64;
+                    }
+                }
+                let n = (p * p) as f64;
+                scores[(oy + r) as usize * side + (ox + r) as usize] = (cross / n - ma * mb) / (va * vb).sqrt();
+            }
+        }
+        let (bi, &best) = scores
+            .iter()
+            .enumerate()
+            .max_by(|u, v| u.1.partial_cmp(v.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or((0, &f64::MIN));
+        let (gx, gy) = ((bi % side) as i64, (bi / side) as i64);
+        // on the border of the search window: the true peak may lie beyond
+        if best < MATCH_MIN_NCC || gx == 0 || gy == 0 || gx == 2 * r || gy == 2 * r {
+            continue;
+        }
+        // a second peak almost as good elsewhere: repeated pattern, ambiguous
+        let rival = scores
+            .iter()
+            .enumerate()
+            .filter(|(q, _)| ((q % side) as i64 - gx).abs() > 2 || ((q / side) as i64 - gy).abs() > 2)
+            .map(|(_, v)| *v)
+            .fold(f64::MIN, f64::max);
+        if rival > best - 0.05 {
+            continue;
+        }
+        let at = |dx: i64, dy: i64| scores[((gy + dy) * side as i64 + gx + dx) as usize];
+        let parab = |l: f64, c: f64, rr: f64| {
+            let d = l - 2.0 * c + rr;
+            if d < -1e-9 {
+                (0.5 * (l - rr) / d).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            }
+        };
+        let fx = parab(at(-1, 0), best, at(1, 0));
+        let fy = parab(at(0, -1), best, at(0, 1));
+        let (mx, my) = ((bx + gx - r) as f64 + fx, (by + gy - r) as f64 + fy);
+        let half = p as f64 / 2.0;
+        let pi = ((x as f64 + half) * k - hi.0, (y as f64 + half) * k - hi.1);
+        let pj = ((mx + half) * k - hj.0, (my + half) * k - hj.1);
+        out.push(PointMatch { i, j, pi, pj, w: best * best });
+    }
+    out
 }
 
 /// Solves for positions, then drops the measurements that disagree with the solution
@@ -792,12 +1145,103 @@ fn gaussian_pyramid(base: Plane) -> Vec<Plane> {
     v
 }
 
+/// Everything that changes how a tile looks in the mosaic: colour corrections and seam priority.
+struct Look {
+    /// Frame maps for each tile size at the export scale.
+    maps: HashMap<(i64, i64), FrameMaps>,
+    tile_gain: Vec<[f32; 3]>,
+    tile_sharp: Vec<f32>,
+}
+
 /// A tile placed on the canvas (canvas px, at the export scale).
 struct Placed {
-    x: i64,
-    y: i64,
+    /// Canvas bounding box, half-open.
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+    /// Axis-aligned canvas rectangle entirely covered by the tile `(x, y, w, h)`.
+    inner: (i64, i64, i64, i64),
+    /// Tile size at the export scale.
     w: i64,
     h: i64,
+    /// Canvas pixel `(X, Y)` → tile pixel `q0 + X·dx + Y·dy` (continuous, pixel centres at integers).
+    q0: (f64, f64),
+    dx: (f64, f64),
+    dy: (f64, f64),
+    /// When the tile is not turned: tile pixel = canvas pixel − shift (no resampling).
+    shift: Option<(i64, i64)>,
+}
+
+impl Placed {
+    /// `pose` in capture px; the canvas is `scale × (board − origin)`; `size` is the tile size in
+    /// capture px and `(w, h)` at the export scale.
+    fn new(pose: &Pose, size: (u32, u32), (w, h): (i64, i64), scale: f64, origin: (f64, f64)) -> Self {
+        let (sw, sh) = (size.0 as f64, size.1 as f64);
+        let (rx, ry) = (w as f64 / sw, h as f64 / sh);
+        let to_tile = |cx: f64, cy: f64| {
+            let p = pose.invert((cx / scale + origin.0, cy / scale + origin.1));
+            ((p.0 + sw / 2.0) * rx - 0.5, (p.1 + sh / 2.0) * ry - 0.5)
+        };
+        let q0 = to_tile(0.5, 0.5);
+        let (qx, qy) = (to_tile(1.5, 0.5), to_tile(0.5, 1.5));
+        let (dx, dy) = ((qx.0 - q0.0, qx.1 - q0.1), (qy.0 - q0.0, qy.1 - q0.1));
+        let off_identity = ((dx.0 - 1.0).abs() + dx.1.abs()) * w.max(h) as f64 + ((dy.1 - 1.0).abs() + dy.0.abs()) * w.max(h) as f64;
+        let shift = (off_identity < 0.3).then(|| (-q0.0.round() as i64, -q0.1.round() as i64));
+        // corners on the canvas (continuous coordinates)
+        let corners: Vec<(f64, f64)> = [(-sw / 2.0, -sh / 2.0), (sw / 2.0, -sh / 2.0), (-sw / 2.0, sh / 2.0), (sw / 2.0, sh / 2.0)]
+            .iter()
+            .map(|&p| {
+                let b = pose.apply(p);
+                ((b.0 - origin.0) * scale, (b.1 - origin.1) * scale)
+            })
+            .collect();
+        if let Some((sx, sy)) = shift {
+            return Self { x0: sx, y0: sy, x1: sx + w, y1: sy + h, inner: (sx, sy, w, h), w, h, q0, dx, dy, shift };
+        }
+        let mut xs: Vec<f64> = corners.iter().map(|c| c.0).collect();
+        let mut ys: Vec<f64> = corners.iter().map(|c| c.1).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let inner = (xs[1].ceil() as i64, ys[1].ceil() as i64, (xs[2].floor() - xs[1].ceil()) as i64, (ys[2].floor() - ys[1].ceil()) as i64);
+        Self {
+            x0: xs[0].floor() as i64,
+            y0: ys[0].floor() as i64,
+            x1: xs[3].ceil() as i64,
+            y1: ys[3].ceil() as i64,
+            inner,
+            w,
+            h,
+            q0,
+            dx,
+            dy,
+            shift,
+        }
+    }
+
+    /// Tile pixel (continuous) under canvas pixel `(x, y)`.
+    fn at(&self, x: i64, y: i64) -> (f64, f64) {
+        let (x, y) = (x as f64, y as f64);
+        (self.q0.0 + x * self.dx.0 + y * self.dy.0, self.q0.1 + x * self.dx.1 + y * self.dy.1)
+    }
+
+    /// Nearest tile pixel under canvas pixel `(x, y)`, if the tile covers it.
+    fn nearest(&self, x: i64, y: i64) -> Option<usize> {
+        let (qx, qy) = match self.shift {
+            Some((sx, sy)) => (x - sx, y - sy),
+            None => {
+                let q = self.at(x, y);
+                (q.0.round() as i64, q.1.round() as i64)
+            }
+        };
+        (qx >= 0 && qy >= 0 && qx < self.w && qy < self.h).then(|| (qy * self.w + qx) as usize)
+    }
+}
+
+/// Catmull-Rom weights for the four samples around a fractional position `t ∈ [0, 1)`.
+fn cubic_weights(t: f32) -> [f32; 4] {
+    let (t2, t3) = (t * t, t * t * t);
+    [(-t3 + 2.0 * t2 - t) * 0.5, (3.0 * t3 - 5.0 * t2 + 2.0) * 0.5, (-3.0 * t3 + 4.0 * t2 + t) * 0.5, (t3 - t2) * 0.5]
 }
 
 /// Blends the canvas block whose extended region starts at `(ex, ey)`, `ew × eh` px wide.
@@ -805,29 +1249,29 @@ struct Placed {
 fn blend_block(
     set: &TileSet,
     placed: &[Placed],
-    gains: &[f32],
+    look: &Look,
     contrib: &[usize],
     (ex, ey, ew, eh): (i64, i64, usize, usize),
 ) -> Result<([Plane; 3], Vec<bool>)> {
-    // Owner of each pixel: the tile it sits most centrally in.
+    // Owner of each pixel: the tile in which it sits most centrally and sharply.
     let mut best = vec![0f32; ew * eh];
     let mut owner = vec![NONE; ew * eh];
     for (ci, &ti) in contrib.iter().enumerate() {
         let pl = &placed[ti];
+        let Some(maps) = look.maps.get(&(pl.w, pl.h)) else { continue };
+        let ts = look.tile_sharp[ti];
         for y in 0..eh {
             let gy = ey + y as i64;
-            if gy < pl.y || gy >= pl.y + pl.h {
+            if gy < pl.y0 || gy >= pl.y1 {
                 continue;
             }
-            let v = ((gy - pl.y) as f32 + 0.5) / pl.h as f32;
-            let wy = 0.5 - (v - 0.5).abs();
             for x in 0..ew {
                 let gx = ex + x as i64;
-                if gx < pl.x || gx >= pl.x + pl.w {
+                if gx < pl.x0 || gx >= pl.x1 {
                     continue;
                 }
-                let u = ((gx - pl.x) as f32 + 0.5) / pl.w as f32;
-                let wgt = wy * (0.5 - (u - 0.5).abs());
+                let Some(qi) = pl.nearest(gx, gy) else { continue };
+                let wgt = maps.quality[qi] * ts;
                 if wgt > best[y * ew + x] {
                     best[y * ew + x] = wgt;
                     owner[y * ew + x] = ci as u16;
@@ -843,7 +1287,8 @@ fn blend_block(
     for (ci, &ti) in contrib.iter().enumerate() {
         let img = set.load(ti)?;
         let pl = &placed[ti];
-        let g = gains[ti];
+        let tg = look.tile_gain[ti];
+        let Some(maps) = look.maps.get(&(pl.w, pl.h)) else { anyhow::bail!("internal: no frame maps") };
         let mut m = Plane::new(ew, eh);
         for (i, &o) in owner.iter().enumerate() {
             if o as usize == ci {
@@ -853,13 +1298,41 @@ fn blend_block(
         let mut ch = [Plane::new(ew, eh), Plane::new(ew, eh), Plane::new(ew, eh)];
         let raw = img.as_raw();
         let stride = img.width() as usize * 3;
+        let (tw, th) = (pl.w, pl.h);
         for y in 0..eh {
-            let sy = (ey + y as i64 - pl.y).clamp(0, pl.h - 1) as usize;
+            let gy = ey + y as i64;
             for x in 0..ew {
-                let sx = (ex + x as i64 - pl.x).clamp(0, pl.w - 1) as usize;
-                let o = sy * stride + sx * 3;
+                let gx = ex + x as i64;
+                // beyond the tile, its border is replicated (the mask is zero there anyway, but the
+                // coarse bands of the pyramid reach a little past the seam)
+                let (v, m) = match pl.shift {
+                    Some((sx, sy)) => {
+                        let (qx, qy) = ((gx - sx).clamp(0, tw - 1) as usize, (gy - sy).clamp(0, th - 1) as usize);
+                        let o = qy * stride + qx * 3;
+                        ([raw[o] as f32, raw[o + 1] as f32, raw[o + 2] as f32], qy * tw as usize + qx)
+                    }
+                    None => {
+                        let q = pl.at(gx, gy);
+                        let (qx, qy) = (q.0.clamp(0.0, (tw - 1) as f64), q.1.clamp(0.0, (th - 1) as f64));
+                        let (fx, fy) = (qx.floor(), qy.floor());
+                        let (wx, wy) = (cubic_weights((qx - fx) as f32), cubic_weights((qy - fy) as f32));
+                        let mut v = [0f32; 3];
+                        for (j, wyj) in wy.iter().enumerate() {
+                            let sy = (fy as i64 + j as i64 - 1).clamp(0, th - 1) as usize;
+                            for (i, wxi) in wx.iter().enumerate() {
+                                let sx = (fx as i64 + i as i64 - 1).clamp(0, tw - 1) as usize;
+                                let o = sy * stride + sx * 3;
+                                let wgt = wyj * wxi;
+                                v[0] += wgt * raw[o] as f32;
+                                v[1] += wgt * raw[o + 1] as f32;
+                                v[2] += wgt * raw[o + 2] as f32;
+                            }
+                        }
+                        (v, qy.round() as usize * tw as usize + qx.round() as usize)
+                    }
+                };
                 for c in 0..3 {
-                    ch[c].d[y * ew + x] = raw[o + c] as f32 * g;
+                    ch[c].d[y * ew + x] = v[c] * tg[c] * maps.gain[c][m];
                 }
             }
         }
@@ -962,11 +1435,15 @@ pub fn export_session(
     let mut start = p0.clone();
     let mut coarse_pairs = 0;
     let mut kept_smalls: Vec<Option<Small>> = Vec::new();
-    if opts.refine && n > 1 {
+    let mut grids: Vec<Option<Grids>> = (0..n).map(|_| None).collect();
+    let mut coarse_kept: Vec<PairMeasure> = Vec::new();
+    let debug = std::env::var_os("PCBMAPPER_DEBUG").is_some();
+    if (opts.refine || opts.match_brightness) && n > 1 {
         progress.set("Registering tiles", 0.0);
         let coarse_k = opts.coarse_k.clamp(1, 8);
         let coarse_set = TileSet::new(session_dir, meta.clone(), 1.0, opts.cache_bytes);
         let smalls: Mutex<Vec<Option<Small>>> = Mutex::new((0..n).map(|_| None).collect());
+        let grids_m: Mutex<Vec<Option<Grids>>> = Mutex::new((0..n).map(|_| None).collect());
         let next = AtomicUsize::new(0);
         let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
         std::thread::scope(|s| {
@@ -978,8 +1455,11 @@ pub fn export_session(
                     }
                     match coarse_set.load(i) {
                         Ok(img) => {
-                            let g = gray_small(&img, coarse_k);
-                            let small = Small { w: g.width() as usize, h: g.height() as usize, k: coarse_k, px: to_f32(&g) };
+                            let small = Small::new(&gray_small(&img, coarse_k), coarse_k);
+                            let grid = Grids::new(&img, &small);
+                            if let Ok(mut v) = grids_m.lock() {
+                                v[i] = Some(grid);
+                            }
                             if let Ok(mut v) = smalls.lock() {
                                 v[i] = Some(small);
                             }
@@ -1000,8 +1480,8 @@ pub fn export_session(
         }
         drop(coarse_set);
         let smalls: Vec<Option<Small>> = smalls.into_inner().unwrap_or_default();
-        let debug = std::env::var_os("PCBMAPPER_DEBUG").is_some();
-        let cand = near_pairs(&meta, &p0);
+        grids = grids_m.into_inner().unwrap_or_default();
+        let cand = if opts.refine { near_pairs(&meta, &p0) } else { Vec::new() };
         let found: Mutex<Vec<PairMeasure>> = Mutex::new(Vec::new());
         let next = AtomicUsize::new(0);
         let done = AtomicUsize::new(0);
@@ -1057,6 +1537,7 @@ pub fn export_session(
         kept_smalls = smalls;
         let (pos, kept) = solve_robust(&p0, found, 12.0);
         coarse_pairs = kept.len();
+        coarse_kept = kept;
         if debug {
             eprintln!("coarse: {} candidates, {} accepted, {} kept", cand.len(), found_n, coarse_pairs);
         }
@@ -1068,11 +1549,10 @@ pub fn export_session(
     let measure_set = TileSet::new(session_dir, meta.clone(), 1.0, opts.cache_bytes);
     let pairs = overlapping_pairs(&meta, &start);
     let measures: Mutex<Vec<PairMeasure>> = Mutex::new(Vec::new());
-    let stats: Mutex<Vec<PairStat>> = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    if opts.refine || opts.match_brightness {
+    if opts.refine {
         std::thread::scope(|s| {
             for _ in 0..threads().min(pairs.len().max(1)) {
                 s.spawn(|| {
@@ -1084,12 +1564,9 @@ pub fn export_session(
                         }
                         let (i, j) = pairs[idx];
                         match measure_pair(&measure_set, i, j, &start, &mut pcs, opts.fine_side.max(128) as f64) {
-                            Ok((m, st)) => {
+                            Ok(m) => {
                                 if let (Some(m), Ok(mut g)) = (m, measures.lock()) {
                                     g.push(m);
-                                }
-                                if let (Some(st), Ok(mut g)) = (st, stats.lock()) {
-                                    g.push(st);
                                 }
                             }
                             Err(e) => {
@@ -1113,8 +1590,19 @@ pub fn export_session(
         bail!("export cancelled");
     }
     drop(measure_set);
-    let measures = measures.into_inner().unwrap_or_default();
-    let stats = stats.into_inner().unwrap_or_default();
+    let mut measures = measures.into_inner().unwrap_or_default();
+    // Pairs whose overlap phase correlation could not measure (typically one side out of focus)
+    // keep their coarse measurement, so the fine solve does not leave them to the prior alone.
+    if !measures.is_empty() {
+        let fine: std::collections::HashSet<(usize, usize)> = measures.iter().map(|m| (m.i, m.j)).collect();
+        let mean_w = measures.iter().map(|m| m.w).sum::<f64>() / measures.len() as f64;
+        let max_cw = coarse_kept.iter().map(|m| m.w).fold(1e-9, f64::max);
+        for m in &coarse_kept {
+            if !fine.contains(&(m.i, m.j)) {
+                measures.push(PairMeasure { w: 0.5 * mean_w * m.w / max_cw, ..*m });
+            }
+        }
+    }
 
     progress.set("Aligning tiles", 0.36);
     let mut positions = start.clone();
@@ -1124,7 +1612,33 @@ pub fn export_session(
         positions = pos;
         pairs_used = kept.len();
     }
-    let overlap_error = if kept_smalls.is_empty() { None } else { overlap_error(&kept_smalls, &positions) };
+    // ---- 2b) per-tile rotation: local matches over every overlap, one similarity per tile
+    let mut poses: Vec<Pose> = positions.iter().zip(&meta).map(|(p, m)| Pose::from_position(*p, m.width, m.height)).collect();
+    if opts.refine && n > 1 && !kept_smalls.is_empty() {
+        progress.set("Aligning tiles", 0.37);
+        let pairs = overlapping_pairs(&meta, &positions);
+        let matches = local_matches(&kept_smalls, &meta, &poses, &pairs);
+        let size = meta.iter().map(|m| m.width.max(m.height) as f64).fold(0.0, f64::max);
+        let fit = solve_poses(&poses, &matches, size);
+        if debug {
+            eprintln!(
+                "poses: {} local matches ({} kept), rms {:.2} px -> {:.2} px; angles {:?}",
+                matches.len(),
+                fit.kept,
+                fit.rms_before,
+                fit.rms_after,
+                fit.poses.iter().map(|p| format!("{:.2}°", p.angle_deg())).collect::<Vec<_>>()
+            );
+        }
+        poses = fit.poses;
+    }
+    if let Some(p) = std::env::var_os("PCBMAPPER_DUMP_POSITIONS") {
+        let v: Vec<(String, f64, f64, f64, f64)> = meta.iter().zip(&poses).map(|(m, p)| (m.file.clone(), p.cx, p.cy, p.a, p.b)).collect();
+        let _ = std::fs::write(p, serde_json::to_string(&v).unwrap_or_default());
+    }
+    // top-left corners, for what only needs the layout roughly
+    let positions: Vec<(f64, f64)> = poses.iter().zip(&meta).map(|(p, m)| (p.cx - m.width as f64 / 2.0, p.cy - m.height as f64 / 2.0)).collect();
+    let overlap_error = if kept_smalls.is_empty() || !opts.refine { None } else { overlap_error(&kept_smalls, &meta, &poses) };
     drop(kept_smalls);
     let max_correction = positions
         .iter()
@@ -1132,19 +1646,70 @@ pub fn export_session(
         .map(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1))
         .fold(0.0, f64::max);
 
-    // ---- 3) brightness
+    // ---- 3) colour and focus models of the frame, from the overlaps at their final positions
     progress.set("Matching brightness", 0.38);
-    let gains: Vec<f32> = if opts.match_brightness && !stats.is_empty() {
-        compute_gains(n, &stats).into_iter().map(|g| g as f32).collect()
-    } else {
-        vec![1.0; n]
-    };
+    let final_pairs = overlapping_pairs(&meta, &positions);
+    let colour = (opts.match_brightness && grids.iter().any(|g| g.is_some()))
+        .then(|| fit_colour(&grids, &meta, &poses, &final_pairs))
+        .filter(|c| c.iter().all(|f| f.samples > 0));
+    let focus = grids.iter().any(|g| g.is_some()).then(|| fit_focus(&grids, &meta, &poses, &final_pairs)).filter(|f| f.samples > 0);
+    drop(grids);
+    if debug {
+        if let Some(c) = &colour {
+            for (name, f) in ["red", "green", "blue"].iter().zip(c.iter()) {
+                eprintln!(
+                    "colour {name}: {} samples, ln-ratio rms {:.3} -> robust spread {:.3}; frame at corners {:.2} {:.2} {:.2} {:.2}, edges L/R {:.2} {:.2}",
+                    f.samples,
+                    f.rms_before,
+                    f.sigma_after,
+                    (-(f.frame(-1.0, -1.0) - f.frame_mean())).exp(),
+                    (-(f.frame(1.0, -1.0) - f.frame_mean())).exp(),
+                    (-(f.frame(-1.0, 1.0) - f.frame_mean())).exp(),
+                    (-(f.frame(1.0, 1.0) - f.frame_mean())).exp(),
+                    (-(f.frame(-1.0, 0.0) - f.frame_mean())).exp(),
+                    (-(f.frame(1.0, 0.0) - f.frame_mean())).exp(),
+                );
+            }
+        }
+        if let Some(f) = &focus {
+            let row = |v: f64| (0..5).map(|k| format!("{:.2}", (f.frame(-1.0 + 0.5 * k as f64, v) - f.frame_mean()).exp())).collect::<Vec<_>>().join(" ");
+            eprintln!("focus: {} samples, sharpness top [{}] middle [{}] bottom [{}]", f.samples, row(-0.9), row(0.0), row(0.9));
+            eprintln!("focus per tile: {:?}", f.tile.iter().map(|t| format!("{:.2}", t.exp())).collect::<Vec<_>>());
+        }
+    }
+    // per-tile factors, centred so that the mosaic keeps the session's average colour
+    let tile_gain: Vec<[f32; 3]> = (0..n)
+        .map(|i| {
+            [0, 1, 2].map(|c| {
+                colour.as_ref().map_or(1.0, |cf| {
+                    let mean = cf[c].tile.iter().sum::<f64>() / n as f64;
+                    (-(cf[c].tile[i] - mean)).exp().clamp(0.5, 2.0) as f32
+                })
+            })
+        })
+        .collect();
+    let tile_sharp: Vec<f32> = (0..n)
+        .map(|i| {
+            focus.as_ref().map_or(1.0, |f| {
+                let mean = f.tile.iter().sum::<f64>() / n as f64;
+                (FOCUS_GAMMA * (f.tile[i] - mean).clamp(-6.0, 6.0)).exp() as f32
+            })
+        })
+        .collect();
 
     // ---- 4) canvas geometry (and scale, to respect the pixel cap)
-    let min_x = positions.iter().map(|p| p.0).fold(f64::MAX, f64::min);
-    let min_y = positions.iter().map(|p| p.1).fold(f64::MAX, f64::min);
-    let max_x = positions.iter().zip(&meta).map(|(p, m)| p.0 + m.width as f64).fold(f64::MIN, f64::max);
-    let max_y = positions.iter().zip(&meta).map(|(p, m)| p.1 + m.height as f64).fold(f64::MIN, f64::max);
+    let corners: Vec<(f64, f64)> = poses
+        .iter()
+        .zip(&meta)
+        .flat_map(|(p, m)| {
+            let (hw, hh) = (m.width as f64 / 2.0, m.height as f64 / 2.0);
+            [(-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh)].map(|c| p.apply(c))
+        })
+        .collect();
+    let min_x = corners.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+    let min_y = corners.iter().map(|p| p.1).fold(f64::MAX, f64::min);
+    let max_x = corners.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+    let max_y = corners.iter().map(|p| p.1).fold(f64::MIN, f64::max);
     let (full_w, full_h) = ((max_x - min_x).ceil().max(1.0), (max_y - min_y).ceil().max(1.0));
     let mut scale = opts.scale.clamp(0.05, 1.0) as f64;
     let cap = (opts.max_pixels as f64 / (full_w * full_h)).sqrt();
@@ -1155,21 +1720,12 @@ pub fn export_session(
     let blend_set = TileSet::new(session_dir, meta.clone(), scale, opts.cache_bytes);
     let placed: Vec<Placed> = (0..n)
         .map(|i| {
-            let (w, h) = blend_set.size(i);
-            Placed {
-                x: ((positions[i].0 - min_x) * scale as f64).round() as i64,
-                y: ((positions[i].1 - min_y) * scale as f64).round() as i64,
-                w,
-                h,
-            }
+            Placed::new(&poses[i], (meta[i].width, meta[i].height), blend_set.size(i), scale as f64, (min_x, min_y))
         })
         .collect();
-    let (cw, ch) = (
-        placed.iter().map(|p| p.x + p.w).max().unwrap_or(1),
-        placed.iter().map(|p| p.y + p.h).max().unwrap_or(1),
-    );
+    let (cw, ch) = (placed.iter().map(|p| p.x1).max().unwrap_or(1), placed.iter().map(|p| p.y1).max().unwrap_or(1));
     let (rx, ry, rw, rh) = if opts.crop {
-        let rects: Vec<_> = placed.iter().map(|p| (p.x, p.y, p.w, p.h)).collect();
+        let rects: Vec<_> = placed.iter().map(|p| p.inner).collect();
         covered_rect(&rects, cw, ch)
     } else {
         (0, 0, cw, ch)
@@ -1194,7 +1750,12 @@ pub fn export_session(
         ny += 1;
     }
     let mut canvas = RgbaImage::new(rw as u32, rh as u32);
-    let gains_ref = &gains;
+    let mut maps = HashMap::new();
+    for p in &placed {
+        maps.entry((p.w, p.h)).or_insert_with(|| frame_maps(p.w as usize, p.h as usize, colour.as_ref(), focus.as_ref()));
+    }
+    let look = Look { maps, tile_gain, tile_sharp };
+    let look_ref = &look;
     let (placed_ref, set_ref) = (&placed, &blend_set);
     let next = AtomicUsize::new(0);
     let (tx, rx_chan) = mpsc::channel::<Result<(i64, i64, i64, i64, Vec<u8>)>>();
@@ -1212,14 +1773,14 @@ pub fn export_session(
                 let contrib: Vec<usize> = (0..placed_ref.len())
                     .filter(|&i| {
                         let p = &placed_ref[i];
-                        p.x < ext.0 + ext.2 as i64 && p.x + p.w > ext.0 && p.y < ext.1 + ext.3 as i64 && p.y + p.h > ext.1
+                        p.x0 < ext.0 + ext.2 as i64 && p.x1 > ext.0 && p.y0 < ext.1 + ext.3 as i64 && p.y1 > ext.1
                     })
                     .collect();
                 let mut rgba = vec![0u8; (bw * bh * 4) as usize];
                 let res: Result<()> = if contrib.is_empty() {
                     Ok(())
                 } else {
-                    blend_block(set_ref, placed_ref, gains_ref, &contrib, ext).map(|(planes, covered)| {
+                    blend_block(set_ref, placed_ref, look_ref, &contrib, ext).map(|(planes, covered)| {
                         for y in 0..bh as usize {
                             for x in 0..bw as usize {
                                 let ei = (y + MARGIN) * ext.2 + x + MARGIN;
@@ -1321,22 +1882,6 @@ mod tests {
             let (ex, ey) = (r[k].0 - r[0].0 - (truth[k].0 - truth[0].0), r[k].1 - r[0].1 - (truth[k].1 - truth[0].1));
             assert!(ex.abs() < 0.2 && ey.abs() < 0.2, "tile {k}: {ex:.2},{ey:.2}");
         }
-    }
-
-    #[test]
-    fn gains_equalise_overlaps() {
-        // tile 1 is 10 % darker, tile 2 is 8 % brighter than tile 0
-        let base = 120.0;
-        let level = [1.0, 0.9, 1.08];
-        let stats = vec![
-            PairStat { i: 0, j: 1, mi: base * level[0], mj: base * level[1], n: 1.0 },
-            PairStat { i: 1, j: 2, mi: base * level[1], mj: base * level[2], n: 1.0 },
-            PairStat { i: 0, j: 2, mi: base * level[0], mj: base * level[2], n: 1.0 },
-        ];
-        let g = compute_gains(3, &stats);
-        let seen: Vec<f64> = (0..3).map(|i| g[i] * level[i]).collect();
-        let spread = seen.iter().cloned().fold(f64::MIN, f64::max) - seen.iter().cloned().fold(f64::MAX, f64::min);
-        assert!(spread < 0.02, "{seen:?}");
     }
 
     #[test]
@@ -1521,16 +2066,76 @@ mod tests {
                 120.0 + ((x * 13 + y * 7).rem_euclid(5)) as f32
             }
         };
-        let make = |ox: i64| Small {
-            w: 240,
-            h: 135,
-            k: 4,
-            px: (0..135).flat_map(|y| (0..240).map(move |x| (x as i64, y as i64))).map(|(x, y)| scene(x + ox, y)).collect(),
+        let make = |ox: i64| {
+            let px: Vec<f32> = (0..135).flat_map(|y| (0..240).map(move |x| (x as i64, y as i64))).map(|(x, y)| scene(x + ox, y)).collect();
+            Small { w: 240, h: 135, k: 4, soft: gaussian_blur(&px, 240, 135, SOFT_SIGMA / 4.0), px }
         };
         let (a, b) = (make(0), make(100)); // b(x) = a(x + 100)  ⇒  content shift d = -100
         let (good, good_patches, _) = patch_score(&a, &b, -100, 0).expect("enough texture");
         let (bad, _, _) = patch_score(&a, &b, -40, 0).expect("enough texture");
         assert!(good > 0.9 && good_patches >= 6, "true shift scored {good:.2} on {good_patches} patches");
         assert!(bad < 0.5, "a wrong shift scored {bad:.2}");
+    }
+
+    /// Tiles of a board turned by up to 0.7° (a board moved by hand) under a lopsided light, with
+    /// exposure changes: the export must undo the rotations and the light.
+    #[test]
+    fn export_corrects_rotation_and_uneven_light() {
+        let board = synthetic_board(2300, 1300);
+        let (tw, th) = (960u32, 540u32);
+        let root = std::env::temp_dir().join(format!("pcbmapper-export4-{}", std::process::id()));
+        let mut session = Session::create(&root).unwrap();
+        let light = |u: f64, v: f64| (-0.35 * u - 0.2 * u * u - 0.15 * v * v).exp();
+        let angles = [0.4f64, -0.3, 0.7, -0.6, 0.1, 0.5, -0.2, 0.3, -0.5];
+        let expo = [1.0, 0.94, 1.05, 0.97, 1.03, 0.92, 1.06, 0.99, 1.02];
+        let sample = |x: f64, y: f64, c: usize| -> f64 {
+            let (x0, y0) = (x.floor().clamp(0.0, 2298.0), y.floor().clamp(0.0, 1298.0));
+            let (fx, fy) = ((x - x0).clamp(0.0, 1.0), (y - y0).clamp(0.0, 1.0));
+            let p = |dx: u32, dy: u32| board.get_pixel(x0 as u32 + dx, y0 as u32 + dy).0[c] as f64;
+            (p(0, 0) * (1.0 - fx) + p(1, 0) * fx) * (1.0 - fy) + (p(0, 1) * (1.0 - fx) + p(1, 1) * fx) * fy
+        };
+        let mut k = 0;
+        for &cy in &[300.0f64, 650.0, 1000.0] {
+            for &cx in &[500.0f64, 1150.0, 1800.0] {
+                let pose = Pose { a: 0.0, b: angles[k].to_radians().sin(), cx, cy };
+                let tile = RgbImage::from_fn(tw, th, |x, y| {
+                    let p = (x as f64 + 0.5 - tw as f64 / 2.0, y as f64 + 0.5 - th as f64 / 2.0);
+                    let q = pose.apply(p);
+                    let g = expo[k] * light(p.0 / (tw as f64 / 2.0), p.1 / (th as f64 / 2.0));
+                    Rgb([0, 1, 2].map(|c| (sample(q.0 - 0.5, q.1 - 0.5, c) * g).round().clamp(0.0, 255.0) as u8))
+                });
+                // the tracker only knew translations, a little off
+                session.add_tile(&tile, (cx - tw as f64 / 2.0 + 3.0, cy - th as f64 / 2.0 - 2.0)).unwrap();
+                k += 1;
+            }
+        }
+        let out = root.join("mosaic.png");
+        let r = export_session(session.dir(), &out, &ExportOptions::default(), &Progress::new(None)).unwrap();
+        let mosaic = image::open(&out).unwrap().to_rgb8();
+        // compare with the board around the centre, after the best global offset and gain
+        let mut best = f64::MAX;
+        for oy in -10..=10i64 {
+            for ox in -10..=10i64 {
+                let mut pairs = Vec::new();
+                for y in (200..1000u32).step_by(7) {
+                    for x in (300..1700u32).step_by(7) {
+                        let (bx, by) = (x as i64 + ox + 20, y as i64 + oy + 30);
+                        if x < mosaic.width() && y < mosaic.height() && bx >= 0 && by >= 0 && bx < 2300 && by < 1300 {
+                            let a = mosaic.get_pixel(x, y).0;
+                            let b = board.get_pixel(bx as u32, by as u32).0;
+                            if a.iter().all(|v| *v < 250) {
+                                pairs.push((a.iter().map(|v| *v as f64).sum::<f64>(), b.iter().map(|v| *v as f64).sum::<f64>()));
+                            }
+                        }
+                    }
+                }
+                let g = pairs.iter().map(|p| p.0 * p.1).sum::<f64>() / pairs.iter().map(|p| p.1 * p.1).sum::<f64>().max(1e-9);
+                let e = pairs.iter().map(|p| (p.0 - g * p.1).abs() / 3.0).sum::<f64>() / pairs.len().max(1) as f64;
+                best = best.min(e);
+            }
+        }
+        eprintln!("export: {}x{}, {} pairs; mean abs difference to the board {best:.2} levels", r.width, r.height, r.pairs_used);
+        assert!(best < 6.0, "the mosaic differs from the board by {best:.2} levels");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1,4 +1,4 @@
-//! PCB Mapper — Rune UI: start menu (source picker), live view with overlays,
+//! Rune UI: start menu (source picker), live view with overlays,
 //! side panel (mosaic, capture steps, metrics, details).
 //!
 //! `--camera <index> [--res WxH] [--yuyv]` skips the start menu.
@@ -7,13 +7,13 @@
 //! UI testing without any source: `--fake stabilize|move|lost|closing|down|finished|dialog`
 //! shows a frozen state.
 
-use pcb_mapper::analysis::Report;
-use pcb_mapper::camera::{Mode, PixelFormat, SourceSpec};
-use pcb_mapper::capture::{Params, State as CaptureState};
-use pcb_mapper::export::{export_session, ExportOptions, ExportResult, Format, Progress};
-use pcb_mapper::guidance::{Phase, Then};
-use pcb_mapper::mosaic::Preview;
-use pcb_mapper::pipeline::{Control, Event, Pipeline};
+use mosaix::analysis::Report;
+use mosaix::camera::{Mode, PixelFormat, SourceSpec};
+use mosaix::capture::{Params, State as CaptureState};
+use mosaix::export::{export_session, ExportOptions, ExportResult, Format, Progress};
+use mosaix::guidance::{Phase, Then};
+use mosaix::mosaic::Preview;
+use mosaix::pipeline::{Control, Event, Pipeline};
 use rune::tok::{self, type_};
 use rune::{
     canvas, col, el, row, spacer, text, AppSpec, Color, Cx, El, FileDialogOptions, Key, KeyEvent, Pixels,
@@ -21,6 +21,9 @@ use rune::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Name shown in the window title and the start menu (change it here only).
+const APP_NAME: &str = "Mosaïx";
 
 /// Max width of the image uploaded to the GPU for the live view.
 const LIVE_MAX_W: u32 = 960;
@@ -138,8 +141,8 @@ fn parse_args() -> Option<SourceSpec> {
 
 /// Frozen UI state for visual testing (`--fake <state>`): no threads, no source.
 fn apply_fake(app: &mut App, kind: &str) {
-    use pcb_mapper::mosaic::Mosaic;
-    let board = pcb_mapper::camera::synthetic_board(1920, 1080);
+    use mosaix::mosaic::Mosaic;
+    let board = mosaix::camera::synthetic_board(1920, 1080);
     let view = image::imageops::crop_imm(&board, 320, 180, 1280, 720).to_image();
     app.live.set(view.width(), view.height(), rgb_to_rgba(&view));
     let mut mosaic = Mosaic::new();
@@ -254,7 +257,7 @@ fn setup(s: &mut App, waker: Waker) {
     let cams = s.cams.clone();
     std::thread::spawn(move || {
         #[cfg(feature = "camera")]
-        let result = match pcb_mapper::camera::nokhwa_source::list_cameras() {
+        let result = match mosaix::camera::nokhwa_source::list_cameras() {
             Ok(v) => CamList::Ready(v),
             Err(e) => CamList::Unavailable(format!("{e}")),
         };
@@ -279,7 +282,7 @@ fn request_modes(s: &mut App, index: u32) {
     let modes = s.menu.modes.clone();
     std::thread::spawn(move || {
         #[cfg(feature = "camera")]
-        let result = pcb_mapper::camera::nokhwa_source::list_modes(index);
+        let result = mosaix::camera::nokhwa_source::list_modes(index);
         #[cfg(not(feature = "camera"))]
         let result: anyhow::Result<Vec<Mode>> = Err(anyhow::anyhow!("built without camera support"));
         if let Ok(mut g) = modes.lock() {
@@ -402,7 +405,7 @@ fn poll(s: &mut App, clock: f64, _: &mut Tx) -> bool {
                 let k = f.width().div_ceil(LIVE_MAX_W).max(1);
                 let small;
                 let img = if k > 1 {
-                    small = pcb_mapper::tracking::rgb_downscale(f, k);
+                    small = mosaix::tracking::rgb_downscale(f, k);
                     &small
                 } else {
                     f
@@ -854,8 +857,8 @@ fn menu_view(s: &App) -> El {
         .padding(28.0)
         .radius(16.0)
         .fill(card())
-        .child(text("PCB Mapper".to_string()).font(type_::TITLE).color(Color::WHITE))
-        .child(text("Choose a camera to start mapping.".to_string()).font(type_::BODY).color(soft()))
+        .child(text(APP_NAME.to_string()).font(type_::TITLE).color(Color::WHITE))
+        .child(text("Choose a camera, then slide the object under it row by row.".to_string()).font(type_::BODY).color(soft()))
         .child(cams)
         .child(folder);
     if let Some(e) = &s.menu.error {
@@ -905,7 +908,7 @@ fn next_step(s: &App, r: &Report) -> (String, String) {
     if r.tiles == 0 {
         return (
             "Hold still for the first tile".into(),
-            "Start at the top-left corner of the board. Press E at the end of each row.".into(),
+            "Start at the top-left corner of the area to map. Press E at the end of each row.".into(),
         );
     }
     match r.state {
@@ -972,7 +975,7 @@ fn reticle(r: &Report, paused: bool) -> El {
 
     let dark = Color::BLACK.alpha(0.45);
     let mut shape = Shape::new()
-        // Track: dark halo + translucent white ring, so it reads on bright and dark boards.
+        // Track: dark halo + translucent white ring, so it reads on bright and dark surfaces.
         .fill(ring(40.0, 53.0, FULL), dark)
         .fill(ring(43.5, 49.5, FULL), Color::WHITE.alpha(0.35));
     if r.tiles > 0 && !paused {
@@ -1161,7 +1164,7 @@ fn view(s: &App, _: &mut Cx<App>) -> El {
 fn cli_export(args: &[String]) -> Option<i32> {
     let at = args.iter().position(|a| a == "--export")?;
     let (Some(dir), Some(out)) = (args.get(at + 1), args.get(at + 2)) else {
-        eprintln!("usage: pcb-mapper --export <session_dir> <out.png|jpg|tif> [--scale 0.5] [--crop] [--no-refine] [--fine-side 1024] [--coarse-k 2]");
+        eprintln!("usage: mosaix --export <session_dir> <out.png|jpg|tif> [--scale 0.5] [--crop] [--no-refine] [--fine-side 1024] [--coarse-k 2]");
         return Some(2);
     };
     let mut opts = ExportOptions::default();
@@ -1223,12 +1226,12 @@ fn cli_list_modes(args: &[String]) -> Option<i32> {
     }
     #[cfg(feature = "camera")]
     {
-        match pcb_mapper::camera::nokhwa_source::list_cameras() {
+        match mosaix::camera::nokhwa_source::list_cameras() {
             Ok(cams) if cams.is_empty() => println!("no camera found"),
             Ok(cams) => {
                 for (i, name) in cams {
                     println!("camera {i}: {name}");
-                    match pcb_mapper::camera::nokhwa_source::list_modes(i) {
+                    match mosaix::camera::nokhwa_source::list_modes(i) {
                         Ok(modes) => {
                             for m in modes {
                                 let f: Vec<String> = m.formats.iter().map(|(pf, fps)| format!("{} @{fps}", pf.label())).collect();
@@ -1255,7 +1258,7 @@ fn cli_list_modes(args: &[String]) -> Option<i32> {
 fn cli_grab(args: &[String]) -> Option<i32> {
     let at = args.iter().position(|a| a == "--grab")?;
     let (Some(idx), Some(res), Some(fmt)) = (args.get(at + 1), args.get(at + 2), args.get(at + 3)) else {
-        eprintln!("usage: pcb-mapper --grab <index> <WxH> <mjpeg|yuyv|nv12> [frames]");
+        eprintln!("usage: mosaix --grab <index> <WxH> <mjpeg|yuyv|nv12> [frames]");
         return Some(2);
     };
     let frames: usize = args.get(at + 4).and_then(|v| v.parse().ok()).unwrap_or(10);
@@ -1313,6 +1316,6 @@ fn main() {
         setup: Some(setup),
         poll: Some(poll),
         on_key: Some(on_key),
-        ..AppSpec::new("PCB Mapper", (1280.0, 780.0), state, view)
+        ..AppSpec::new(APP_NAME, (1280.0, 780.0), state, view)
     });
 }

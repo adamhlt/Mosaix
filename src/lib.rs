@@ -1,4 +1,4 @@
-//! PCB Mapper — high-resolution PCB mapping under a microscope.
+//! Mosaïx — high-resolution mapping of flat objects under a microscope (live capture + stitching).
 
 pub mod align;
 pub mod analysis;

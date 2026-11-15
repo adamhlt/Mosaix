@@ -995,7 +995,7 @@ fn solve_robust(
     } else {
         (pos, measures)
     };
-    if std::env::var_os("PCBMAPPER_DEBUG").is_some() {
+    if std::env::var_os("MOSAIX_DEBUG").is_some() {
         let mut r: Vec<(f64, usize, usize)> = kept.iter().map(|m| (residual(&pos, m), m.i, m.j)).collect();
         r.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let mean = r.iter().map(|x| x.0).sum::<f64>() / r.len().max(1) as f64;
@@ -1437,7 +1437,7 @@ pub fn export_session(
     let mut kept_smalls: Vec<Option<Small>> = Vec::new();
     let mut grids: Vec<Option<Grids>> = (0..n).map(|_| None).collect();
     let mut coarse_kept: Vec<PairMeasure> = Vec::new();
-    let debug = std::env::var_os("PCBMAPPER_DEBUG").is_some();
+    let debug = std::env::var_os("MOSAIX_DEBUG").is_some();
     if (opts.refine || opts.match_brightness) && n > 1 {
         progress.set("Registering tiles", 0.0);
         let coarse_k = opts.coarse_k.clamp(1, 8);
@@ -1632,7 +1632,7 @@ pub fn export_session(
         }
         poses = fit.poses;
     }
-    if let Some(p) = std::env::var_os("PCBMAPPER_DUMP_POSITIONS") {
+    if let Some(p) = std::env::var_os("MOSAIX_DUMP_POSITIONS") {
         let v: Vec<(String, f64, f64, f64, f64)> = meta.iter().zip(&poses).map(|(m, p)| (m.file.clone(), p.cx, p.cy, p.a, p.b)).collect();
         let _ = std::fs::write(p, serde_json::to_string(&v).unwrap_or_default());
     }
@@ -1913,7 +1913,7 @@ mod tests {
     fn export_reconstructs_the_board_despite_drift_and_brightness() {
         let board = synthetic_board(2265, 1274);
         let (tw, th) = (960u32, 540u32);
-        let root = std::env::temp_dir().join(format!("pcbmapper-export-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mosaix-export-{}", std::process::id()));
         let mut session = Session::create(&root).unwrap();
         let mut seed = 7u64;
         let mut rnd = move || {
@@ -1975,7 +1975,7 @@ mod tests {
     #[test]
     fn single_tile_is_reproduced_exactly() {
         let board = synthetic_board(700, 500);
-        let root = std::env::temp_dir().join(format!("pcbmapper-export1-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mosaix-export1-{}", std::process::id()));
         let mut session = Session::create(&root).unwrap();
         let tile = imageops::crop_imm(&board, 20, 10, 640, 400).to_image();
         session.add_tile(&tile, (0.0, 0.0)).unwrap();
@@ -1991,7 +1991,7 @@ mod tests {
     #[test]
     fn export_scale_and_cap_shrink_the_output() {
         let board = synthetic_board(900, 600);
-        let root = std::env::temp_dir().join(format!("pcbmapper-export2-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mosaix-export2-{}", std::process::id()));
         let mut session = Session::create(&root).unwrap();
         session.add_tile(&imageops::crop_imm(&board, 0, 0, 600, 400).to_image(), (0.0, 0.0)).unwrap();
         session.add_tile(&imageops::crop_imm(&board, 300, 200, 600, 400).to_image(), (300.0, 200.0)).unwrap();
@@ -2012,7 +2012,7 @@ mod tests {
     fn export_recovers_from_a_badly_recorded_row_change() {
         let board = synthetic_board(2265, 1274);
         let (tw, th) = (960u32, 540u32);
-        let root = std::env::temp_dir().join(format!("pcbmapper-export3-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mosaix-export3-{}", std::process::id()));
         let mut session = Session::create(&root).unwrap();
         for &(ty, wrong_y) in &[(0u32, 0.0f64), (367, 0.0), (734, 0.0)] {
             // second and third rows are recorded 300 px too low
@@ -2083,7 +2083,7 @@ mod tests {
     fn export_corrects_rotation_and_uneven_light() {
         let board = synthetic_board(2300, 1300);
         let (tw, th) = (960u32, 540u32);
-        let root = std::env::temp_dir().join(format!("pcbmapper-export4-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mosaix-export4-{}", std::process::id()));
         let mut session = Session::create(&root).unwrap();
         let light = |u: f64, v: f64| (-0.35 * u - 0.2 * u * u - 0.15 * v * v).exp();
         let angles = [0.4f64, -0.3, 0.7, -0.6, 0.1, 0.5, -0.2, 0.3, -0.5];

@@ -365,7 +365,7 @@ mod tests {
         let (s_best, s_dull) = (sharpness(&gray_small(&best, 4)), sharpness(&gray_small(&dull, 4)));
         assert!(s_dull / s_best > 0.8 && s_dull < s_best * 0.97, "test frames: {s_dull} vs {s_best}");
 
-        let root = std::env::temp_dir().join(format!("pcbmapper-bestof-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mosaix-bestof-{}", std::process::id()));
         let session = Session::create(&root).unwrap();
         let mut an = Analyzer::new(Params::default(), Some(session));
         let mut captured = false;

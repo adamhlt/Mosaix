@@ -1,16 +1,16 @@
 [package]
-name = "pcb-mapper"
+name = "mosaix"
 version = "0.1.0"
 edition = "2021"
-description = "Cartographie haute résolution de PCB au microscope (capture + assemblage en direct)"
+description = "Cartographie haute résolution d'objets plats au microscope (capture + assemblage en direct)"
 license = "MIT"
 
 [lib]
-name = "pcb_mapper"
+name = "mosaix"
 path = "src/lib.rs"
 
 [[bin]]
-name = "pcb-mapper"
+name = "mosaix"
 path = "src/main.rs"
 required-features = ["ui"]
 

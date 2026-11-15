@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn save_reload_undo() {
-        let root = std::env::temp_dir().join(format!("pcbmapper-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mosaix-test-{}", std::process::id()));
         let mut s = Session::create(&root).unwrap();
         let img = RgbImage::from_pixel(32, 16, Rgb([1, 2, 3]));
         s.add_tile(&img, (10.5, -4.0)).unwrap();

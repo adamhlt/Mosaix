@@ -1,7 +1,7 @@
 //! Headless export without the UI (fast to build):
 //! `cargo run --release --no-default-features --example export -- <session_dir> <out> [--scale 0.5]`
 
-use pcb_mapper::export::{export_session, ExportOptions, Progress};
+use mosaix::export::{export_session, ExportOptions, Progress};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

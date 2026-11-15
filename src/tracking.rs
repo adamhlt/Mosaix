@@ -181,6 +181,19 @@ impl PhaseCorrelator {
 
     /// Correlates two images of the correlator's size (`w*h` values, row by row).
     pub fn correlate(&mut self, a: &[f32], b: &[f32]) -> Shift {
+        self.correlate_window(a, b, None)
+    }
+
+    /// Like [`PhaseCorrelator::correlate`], but only accepts a peak within `radius` pixels of the
+    /// expected shift `(dx0, dy0)`. Useful when a rough prior exists (the recorded layout): the
+    /// best peak near it is found even if a stronger, wrong one exists elsewhere.
+    pub fn correlate_near(&mut self, a: &[f32], b: &[f32], dx0: f64, dy0: f64, radius: usize) -> Shift {
+        let (cx, cy) = ((dx0.round() as i64).rem_euclid(self.w as i64) as usize, (dy0.round() as i64).rem_euclid(self.h as i64) as usize);
+        self.correlate_window(a, b, Some((cx, cy, radius)))
+    }
+
+    /// `window` = (centre x, centre y, radius) in cyclic correlation coordinates.
+    fn correlate_window(&mut self, a: &[f32], b: &[f32], window: Option<(usize, usize, usize)>) -> Shift {
         let (w, h) = (self.w, self.h);
         assert_eq!(a.len(), w * h);
         assert_eq!(b.len(), w * h);
@@ -222,6 +235,11 @@ impl PhaseCorrelator {
         let (mut best, mut px, mut py) = (f32::MIN, 0usize, 0usize);
         for y in 0..h {
             for x in 0..w {
+                if let Some((cx, cy, r)) = window {
+                    if circ_dist(x, cx, w) > r || circ_dist(y, cy, h) > r {
+                        continue;
+                    }
+                }
                 let v = self.buf_a[y * w + x].re * norm;
                 if v > best {
                     best = v;

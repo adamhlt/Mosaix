@@ -1,9 +1,12 @@
-//! Image sources: `CameraSource` abstraction + implementations
-//! (image folder replay, synthetic test bench, nokhwa camera).
+//! Image sources: `CameraSource` abstraction + the nokhwa camera backend, plus a synthetic
+//! test bench (a simulated hand scanning a generated board) used by the tests and `--fake`.
 
-use anyhow::{bail, Context, Result};
+#[cfg(feature = "camera")]
+use anyhow::Context;
+#[cfg(not(feature = "camera"))]
+use anyhow::bail;
+use anyhow::Result;
 use image::{Rgb, RgbImage};
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Image source. No `Send` bound: some camera APIs are not
@@ -15,27 +18,60 @@ pub trait CameraSource {
     fn next_frame(&mut self) -> Result<Option<RgbImage>>;
 }
 
+/// Pixel format a camera delivers (as exposed by the driver).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PixelFormat {
+    /// Motion-JPEG: lossy, light on the bus.
+    Mjpeg,
+    /// Uncompressed 4:2:2.
+    Yuyv,
+    Nv12,
+    Gray,
+    RawRgb,
+    RawBgr,
+}
+
+impl PixelFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            PixelFormat::Mjpeg => "MJPEG",
+            PixelFormat::Yuyv => "YUYV",
+            PixelFormat::Nv12 => "NV12",
+            PixelFormat::Gray => "Gray",
+            PixelFormat::RawRgb => "RGB",
+            PixelFormat::RawBgr => "BGR",
+        }
+    }
+}
+
+/// A resolution the camera really offers, with the formats (and best frame rate) it comes in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mode {
+    pub width: u32,
+    pub height: u32,
+    pub formats: Vec<(PixelFormat, u32)>,
+}
+
+impl Mode {
+    /// Highest frame rate over all formats.
+    pub fn best_fps(&self) -> u32 {
+        self.formats.iter().map(|f| f.1).max().unwrap_or(0)
+    }
+}
+
 /// Transferable description of a source, opened inside the capture thread.
 #[derive(Debug, Clone)]
 pub enum SourceSpec {
-    /// Folder of images sorted by name, replayed at `fps`.
-    Replay { dir: PathBuf, fps: f32, looped: bool },
-    /// Synthetic board scanned in a serpentine pattern (demo without hardware).
-    Synthetic,
-    /// Real camera (`camera` feature).
-    Camera { index: u32, width: u32, height: u32, fps: u32, mjpeg: bool },
+    /// A real camera (`camera` feature).
+    Camera { index: u32, width: u32, height: u32, fps: u32, format: PixelFormat },
 }
 
 impl SourceSpec {
     pub fn open(&self) -> Result<Box<dyn CameraSource>> {
         match self {
-            SourceSpec::Replay { dir, fps, looped } => {
-                Ok(Box::new(ReplaySource::from_dir(dir, *fps, *looped)?))
-            }
-            SourceSpec::Synthetic => Ok(Box::new(ViewportSource::demo())),
             #[cfg(feature = "camera")]
-            SourceSpec::Camera { index, width, height, fps, mjpeg } => {
-                Ok(Box::new(nokhwa_source::NokhwaSource::open(*index, *width, *height, *fps, *mjpeg)?))
+            SourceSpec::Camera { index, width, height, fps, format } => {
+                Ok(Box::new(nokhwa_source::NokhwaSource::open(*index, *width, *height, *fps, *format)?))
             }
             #[cfg(not(feature = "camera"))]
             SourceSpec::Camera { .. } => {
@@ -60,53 +96,6 @@ impl Pacer {
             std::thread::sleep(self.next - now);
         }
         self.next = self.next.max(now) + self.period;
-    }
-}
-
-/// Replays a folder of images.
-pub struct ReplaySource {
-    files: Vec<PathBuf>,
-    idx: usize,
-    looped: bool,
-    pacer: Pacer,
-    label: String,
-}
-
-impl ReplaySource {
-    pub fn from_dir(dir: &Path, fps: f32, looped: bool) -> Result<Self> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .with_context(|| format!("reading folder {}", dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "tif" | "tiff"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            bail!("no image (png/jpg/tiff) in {}", dir.display());
-        }
-        Ok(Self { files, idx: 0, looped, pacer: Pacer::new(fps), label: format!("replay {}", dir.display()) })
-    }
-}
-
-impl CameraSource for ReplaySource {
-    fn name(&self) -> String {
-        self.label.clone()
-    }
-    fn next_frame(&mut self) -> Result<Option<RgbImage>> {
-        if self.idx >= self.files.len() {
-            if !self.looped {
-                return Ok(None);
-            }
-            self.idx = 0;
-        }
-        self.pacer.wait();
-        let p = &self.files[self.idx];
-        self.idx += 1;
-        Ok(Some(image::open(p).with_context(|| format!("image {}", p.display()))?.to_rgb8()))
     }
 }
 
@@ -230,14 +219,6 @@ impl ViewportSource {
         }
     }
 
-    /// Demo: a PCB lying on a flat table, scanned in a serpentine pattern. At the end of each
-    /// row the view overshoots the board edge and waits, so the edge detection has something to
-    /// detect; the last step goes below the board to end the map.
-    pub fn demo() -> Self {
-        let (canvas, path, pauses) = demo_scene();
-        Self::with_path(canvas, (1280, 720), path, pauses, 14.0, Some(30.0))
-    }
-
     pub fn is_done(&self) -> bool {
         self.target >= self.path.len() && self.pause_left == 0
     }
@@ -349,20 +330,72 @@ pub mod nokhwa_source {
             .collect())
     }
 
+    fn to_nokhwa(f: PixelFormat) -> FrameFormat {
+        match f {
+            PixelFormat::Mjpeg => FrameFormat::MJPEG,
+            PixelFormat::Yuyv => FrameFormat::YUYV,
+            PixelFormat::Nv12 => FrameFormat::NV12,
+            PixelFormat::Gray => FrameFormat::GRAY,
+            PixelFormat::RawRgb => FrameFormat::RAWRGB,
+            PixelFormat::RawBgr => FrameFormat::RAWBGR,
+        }
+    }
+
+    fn from_nokhwa(f: FrameFormat) -> PixelFormat {
+        match f {
+            FrameFormat::MJPEG => PixelFormat::Mjpeg,
+            FrameFormat::YUYV => PixelFormat::Yuyv,
+            FrameFormat::NV12 => PixelFormat::Nv12,
+            FrameFormat::GRAY => PixelFormat::Gray,
+            FrameFormat::RAWRGB => PixelFormat::RawRgb,
+            FrameFormat::RAWBGR => PixelFormat::RawBgr,
+        }
+    }
+
+    /// Asks the driver which resolutions and formats the camera really offers, largest first.
+    /// The device is opened (not streamed) for the query, so call it from a worker thread.
+    pub fn list_modes(index: u32) -> Result<Vec<Mode>> {
+        let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+        let mut cam = Camera::new(CameraIndex::Index(index), req)?;
+        let formats = cam.compatible_camera_formats()?;
+        let mut modes: Vec<Mode> = Vec::new();
+        for f in formats {
+            let (w, h) = (f.resolution().width(), f.resolution().height());
+            let (fmt, fps) = (from_nokhwa(f.format()), f.frame_rate());
+            let mode = match modes.iter_mut().find(|m| m.width == w && m.height == h) {
+                Some(m) => m,
+                None => {
+                    modes.push(Mode { width: w, height: h, formats: Vec::new() });
+                    modes.last_mut().expect("just pushed")
+                }
+            };
+            match mode.formats.iter_mut().find(|(pf, _)| *pf == fmt) {
+                Some(e) => e.1 = e.1.max(fps),
+                None => mode.formats.push((fmt, fps)),
+            }
+        }
+        modes.sort_by_key(|m| std::cmp::Reverse(m.width as u64 * m.height as u64));
+        Ok(modes)
+    }
+
     pub struct NokhwaSource {
         cam: Camera,
         label: String,
     }
 
     impl NokhwaSource {
-        pub fn open(index: u32, width: u32, height: u32, fps: u32, mjpeg: bool) -> Result<Self> {
-            let fmt = CameraFormat::new(
-                Resolution::new(width, height),
-                if mjpeg { FrameFormat::MJPEG } else { FrameFormat::YUYV },
-                fps,
-            );
-            let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(fmt));
-            let mut cam = Camera::new(CameraIndex::Index(index), req)?;
+        pub fn open(index: u32, width: u32, height: u32, fps: u32, format: PixelFormat) -> Result<Self> {
+            let fmt = CameraFormat::new(Resolution::new(width, height), to_nokhwa(format), fps);
+            // The modes come from the driver, so ask for exactly that one (resolution, pixel
+            // format and frame rate); fall back to the closest only if the driver refuses.
+            let exact = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(fmt));
+            let mut cam = match Camera::new(CameraIndex::Index(index), exact) {
+                Ok(c) => c,
+                Err(_) => {
+                    let closest = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(fmt));
+                    Camera::new(CameraIndex::Index(index), closest)?
+                }
+            };
             cam.open_stream()?;
             let f = cam.camera_format();
             let label = format!(

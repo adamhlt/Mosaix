@@ -9,6 +9,7 @@ use crate::session::Session;
 use crate::tracking::{gray_small, to_f32, PhaseCorrelator};
 use anyhow::Result;
 use image::{GrayImage, RgbImage};
+use std::collections::VecDeque;
 
 /// Downscale factor for the analysis (÷4 → scale 0.25).
 pub const ANALYSIS_K: u32 = 4;
@@ -18,6 +19,17 @@ pub const CLOSING_MIN_OFFSET: f64 = 0.10;
 
 /// Seconds a suggestion stays up before it is auto-confirmed (demo mode only).
 const AUTO_CONFIRM_SECS: f64 = 1.0;
+
+/// How many recent stable frames compete to become the saved tile (≈ 0.25 s at 30 fps).
+const BEST_OF: usize = 8;
+
+/// A recent stable frame, a candidate for the saved tile.
+struct Recent {
+    frame: RgbImage,
+    gray: GrayImage,
+    sharp: f32,
+    pos: (f64, f64),
+}
 
 /// Reference tile for absolute tracking.
 struct TileRef {
@@ -60,6 +72,7 @@ pub struct Analyzer {
     tiles: Vec<TileRef>,
     pos: (f64, f64),
     last_offset_frac: f64,
+    recent: VecDeque<Recent>,
     pub machine: CaptureMachine,
     pub mosaic: Mosaic,
     pub session: Option<Session>,
@@ -79,6 +92,7 @@ impl Analyzer {
             tiles: Vec::new(),
             pos: (0.0, 0.0),
             last_offset_frac: 0.0,
+            recent: VecDeque::new(),
             machine: CaptureMachine::new(params),
             mosaic: Mosaic::new(),
             session,
@@ -220,14 +234,31 @@ impl Analyzer {
             force_far,
         });
 
-        // 4) capture
+        // 4) capture: the sharpest of the recent stable frames is saved, not merely the one that
+        // happened to trigger (hand tremor and focus breathing make neighbouring frames differ).
+        if motion_px < self.machine.params.stable_px {
+            if self.recent.len() == BEST_OF {
+                self.recent.pop_front();
+            }
+            // Only worth keeping a copy when a capture is plausible soon.
+            self.recent.push_back(Recent { frame: frame.clone(), gray: gray.clone(), sharp, pos: self.pos });
+        } else {
+            self.recent.clear();
+        }
         let capture = d.capture && !self.guide.finished;
         if capture {
+            let best = self
+                .recent
+                .iter()
+                .max_by(|a, b| a.sharp.partial_cmp(&b.sharp).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|r| (r.frame.clone(), r.gray.clone(), r.pos));
+            let (tile_frame, tile_gray, tile_pos) = best.unwrap_or_else(|| (frame.clone(), gray.clone(), self.pos));
             if let Some(s) = &mut self.session {
-                s.add_tile(frame, self.pos)?;
+                s.add_tile(&tile_frame, tile_pos)?;
             }
-            self.mosaic.add(frame, self.pos);
-            self.tiles.push(TileRef { gray: gray.clone(), pos: self.pos });
+            self.mosaic.add(&tile_frame, tile_pos);
+            self.tiles.push(TileRef { gray: tile_gray, pos: tile_pos });
+            self.recent.clear();
             self.guide.tile_captured();
             self.edge.rearm();
         }
@@ -382,5 +413,50 @@ mod tests {
         assert!(ended_row, "the row end was never reached");
         assert!(an.guide.rows_done >= 1, "the manual end-of-row did not advance the guide");
         assert!(an.tile_count() >= 5, "the closing capture and the next row were not captured");
+    }
+
+    /// Among the frames of a stable stretch, the sharpest one is what gets saved.
+    #[test]
+    fn the_sharpest_recent_frame_is_saved() {
+        use crate::focus::sharpness;
+        use crate::tracking::gray_small;
+        use image::imageops;
+
+        let board = synthetic_board(900, 500);
+        let sharp = imageops::crop_imm(&board, 100, 60, 640, 360).to_image();
+        let soft = imageops::blur(&sharp, 1.2);
+        // frame = (1 - a) sharp + a soft, so neighbours differ in sharpness but stay close to it
+        let mix = |a: f32| {
+            let mut f = sharp.clone();
+            for (o, (p, q)) in f.pixels_mut().zip(sharp.pixels().zip(soft.pixels())) {
+                for c in 0..3 {
+                    o.0[c] = (p.0[c] as f32 * (1.0 - a) + q.0[c] as f32 * a).round() as u8;
+                }
+            }
+            f
+        };
+        let (best, dull) = (mix(0.0), mix(0.25));
+        let (s_best, s_dull) = (sharpness(&gray_small(&best, 4)), sharpness(&gray_small(&dull, 4)));
+        assert!(s_dull / s_best > 0.8 && s_dull < s_best * 0.97, "test frames: {s_dull} vs {s_best}");
+
+        let root = std::env::temp_dir().join(format!("pcbmapper-bestof-{}", std::process::id()));
+        let session = Session::create(&root).unwrap();
+        let mut an = Analyzer::new(Params::default(), Some(session));
+        let mut captured = false;
+        for i in 0..20u32 {
+            let frame = if i == 4 { &best } else { &dull };
+            let r = an.process(frame, i as f64 / 30.0).unwrap();
+            captured |= r.captured;
+            if r.captured {
+                assert!(i > 4, "captured before the sharp frame was seen");
+                break;
+            }
+        }
+        assert!(captured, "no capture happened");
+        let dir = an.session.as_ref().unwrap().dir().to_path_buf();
+        let saved = image::open(dir.join("tiles/00001.png")).unwrap().to_rgb8();
+        let s_saved = sharpness(&gray_small(&saved, 4));
+        assert!((s_saved - s_best).abs() < 0.01 * s_best, "saved {s_saved}, sharpest {s_best}, dull {s_dull}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

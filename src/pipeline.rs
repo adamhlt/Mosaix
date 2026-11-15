@@ -83,8 +83,6 @@ impl Pipeline {
         let stop = Arc::new(AtomicBool::new(false));
         let session_dir: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let session_dir_thread = session_dir.clone();
-        // The demo source has no one to click: let it confirm suggestions by itself.
-        let auto_confirm = matches!(spec, SourceSpec::Synthetic);
 
         // Capture thread: reads the source and publishes the latest frame.
         {
@@ -152,7 +150,6 @@ impl Pipeline {
                         }
                     });
                     let mut an = Analyzer::new(params, session);
-                    an.auto_confirm = auto_confirm;
                     let t0 = Instant::now();
                     let mut paused = false;
                     let mut force_preview = false;

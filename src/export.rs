@@ -56,6 +56,12 @@ pub struct ExportOptions {
     /// Match brightness between neighbouring tiles.
     pub match_brightness: bool,
     pub jpeg_quality: u8,
+    /// Reduction factor of the whole-tile registration pass (2 by default, 4 = faster; 1 was
+    /// measured worse on real sessions).
+    pub coarse_k: u32,
+    /// Largest side (px) of the overlap crops used by the fine alignment. Larger is slower and was
+    /// measured *worse* on real sessions (fewer reliable pairs): keep 512 unless experimenting.
+    pub fine_side: u32,
     /// Memory budget for decoded tiles, in bytes (per pass).
     pub cache_bytes: usize,
 }
@@ -69,6 +75,8 @@ impl Default for ExportOptions {
             refine: true,
             match_brightness: true,
             jpeg_quality: 95,
+            coarse_k: 2,
+            fine_side: 512,
             cache_bytes: 1 << 30,
         }
     }
@@ -128,6 +136,9 @@ pub struct ExportResult {
     pub max_correction: f64,
     /// Scale actually used (1.0 = capture resolution).
     pub scale: f32,
+    /// Mean brightness-corrected difference (gray levels) between tiles where they overlap, after
+    /// alignment: the lower, the better registered. `None` without registration data.
+    pub overlap_error: Option<f64>,
 }
 
 // ---------------------------------------------------------------- tile loading
@@ -330,6 +341,7 @@ fn measure_pair(
     j: usize,
     p: &[(f64, f64)],
     pcs: &mut HashMap<(usize, usize), PhaseCorrelator>,
+    fine_side: f64,
 ) -> Result<(Option<PairMeasure>, Option<PairStat>)> {
     let (xi, yi) = rounded(p[i]);
     let (xj, yj) = rounded(p[j]);
@@ -344,7 +356,7 @@ fn measure_pair(
     let (ti, tj) = (set.load(i)?, set.load(j)?);
     let a = imageops::crop_imm(&*ti, (x0 - xi) as u32, (y0 - yi) as u32, ow as u32, oh as u32).to_image();
     let b = imageops::crop_imm(&*tj, (x0 - xj) as u32, (y0 - yj) as u32, ow as u32, oh as u32).to_image();
-    let k = (ow.max(oh) as f64 / 512.0).ceil().max(1.0) as u32;
+    let k = (ow.max(oh) as f64 / fine_side).ceil().max(1.0) as u32;
     let (ga, gb): (GrayImage, GrayImage) = (gray_small(&a, k), gray_small(&b, k));
     let (fa, fb) = (to_f32(&ga), to_f32(&gb));
     let mean = |v: &[f32]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len().max(1) as f64;
@@ -388,17 +400,23 @@ fn overlapping_pairs(meta: &[TileMeta], p: &[(f64, f64)]) -> Vec<(usize, usize)>
 
 // ---------------------------------------------------------------- robust registration
 
-/// Downscale factor of the whole-tile registration pass.
-const COARSE_K: u32 = 4;
-/// Minimum normalised cross-correlation for a coarse offset to be believed.
-const COARSE_MIN_NCC: f64 = 0.45;
+/// Minimum median patch correlation for a coarse offset to be believed.
+const COARSE_MIN_SCORE: f64 = 0.5;
+/// Minimum number of textured patches that must agree.
+const COARSE_MIN_PATCHES: usize = 6;
 /// Minimum overlap (fraction of a tile) for a coarse offset to be believed.
 const COARSE_MIN_OVERLAP: f64 = 0.10;
+/// A coarse offset this far from the recorded layout (fraction of the tile) needs stronger proof.
+const FAR_FROM_RECORDED: f64 = 0.15;
+const PATCH: i64 = 24;
+const PATCH_MIN_VAR: f64 = 16.0;
 
 /// A tile reduced for the coarse registration.
 struct Small {
     w: usize,
     h: usize,
+    /// Reduction factor relative to the capture resolution.
+    k: u32,
     px: Vec<f32>,
 }
 
@@ -419,71 +437,184 @@ fn near_pairs(meta: &[TileMeta], p: &[(f64, f64)]) -> Vec<(usize, usize)> {
     out
 }
 
-/// Normalised cross-correlation of `a` and `b` at the content shift `(dx, dy)` (`b(x) ≈ a(x - d)`),
-/// and the overlap as a fraction of the image.
-fn ncc_at(a: &Small, b: &Small, dx: i64, dy: i64) -> (f64, f64) {
+/// How well `a` and `b` agree at the content shift `(dx, dy)` (`b(x) ≈ a(x - d)`): the *median*
+/// normalised cross-correlation over textured patches of the overlap, the number of such patches
+/// and the overlap as a fraction of the image. `None` when too little texture can be compared.
+///
+/// A single correlation over the whole overlap is easily fooled by content that looks the same
+/// after any shift along one axis (the straight edge of a board against the table, a long trace):
+/// those regions agree at a wrong offset while every real feature disagrees. Patches that carry
+/// texture vote one by one, so a few uniform or edge-only areas cannot outvote the components.
+fn patch_score(a: &Small, b: &Small, dx: i64, dy: i64) -> Option<(f64, usize, f64)> {
     let (w, h) = (a.w as i64, a.h as i64);
     let (x0, x1) = (dx.max(0), (w + dx).min(w));
     let (y0, y1) = (dy.max(0), (h + dy).min(h));
-    if x1 - x0 < 8 || y1 - y0 < 8 {
-        return (0.0, 0.0);
+    if x1 - x0 < PATCH || y1 - y0 < PATCH {
+        return None;
     }
-    let n = ((x1 - x0) * (y1 - y0)) as f64;
-    let (mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    for y in y0..y1 {
-        let (ra, rb) = (((y - dy) * w) as usize, (y * w) as usize);
-        for x in x0..x1 {
-            let va = a.px[ra + (x - dx) as usize] as f64;
-            let vb = b.px[rb + x as usize] as f64;
-            sa += va;
-            sb += vb;
-            saa += va * va;
-            sbb += vb * vb;
-            sab += va * vb;
+    let frac = ((x1 - x0) * (y1 - y0)) as f64 / (w * h) as f64;
+    let n = (PATCH * PATCH) as f64;
+    let mut scores: Vec<f64> = Vec::new();
+    let mut y = y0;
+    while y + PATCH <= y1 {
+        let mut x = x0;
+        while x + PATCH <= x1 {
+            let (mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for py in 0..PATCH {
+                let (ra, rb) = (((y + py - dy) * w) as usize, ((y + py) * w) as usize);
+                for px in 0..PATCH {
+                    let va = a.px[ra + (x + px - dx) as usize] as f64;
+                    let vb = b.px[rb + (x + px) as usize] as f64;
+                    sa += va;
+                    sb += vb;
+                    saa += va * va;
+                    sbb += vb * vb;
+                    sab += va * vb;
+                }
+            }
+            let (va, vb) = ((saa - sa * sa / n) / n, (sbb - sb * sb / n) / n);
+            if va > PATCH_MIN_VAR && vb > PATCH_MIN_VAR {
+                scores.push(((sab - sa * sb / n) / n) / (va * vb).sqrt());
+            }
+            x += PATCH;
         }
+        y += PATCH;
     }
-    let (cov, va, vb) = (sab - sa * sb / n, saa - sa * sa / n, sbb - sb * sb / n);
-    if va < 1e-6 || vb < 1e-6 {
-        return (0.0, n / (w * h) as f64);
+    if scores.len() < 4 {
+        return None;
     }
-    (cov / (va * vb).sqrt(), n / (w * h) as f64)
+    scores.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+    Some((scores[scores.len() / 2], scores.len(), frac))
 }
 
-/// Raw coarse measurement of a tile pair: `(dx, dy, ncc, overlap fraction)`, the shift being the
-/// content shift in reduced pixels (`b(x) ≈ a(x - d)`).
+/// Coarse measurement of a tile pair.
+#[derive(Debug, Clone, Copy)]
+struct Probe {
+    /// Content shift in reduced pixels (`b(x) ≈ a(x - d)`).
+    dx: f64,
+    dy: f64,
+    score: f64,
+    patches: usize,
+    frac: f64,
+    /// Found by searching near the recorded layout rather than anywhere.
+    near_recorded: bool,
+}
+
+/// Measures the offset of two whole tiles. `recorded` is the layout's `p_j - p_i` (capture px).
 ///
-/// Phase correlation is cyclic: a shift larger than half the image comes out wrapped (by exactly
-/// one image size). Both candidates are tried on each axis and normalised cross-correlation of
-/// the overlap they imply picks the right one.
-fn coarse_probe(a: &Small, b: &Small, pc: &mut PhaseCorrelator) -> Option<(f64, f64, f64, f64)> {
+/// Candidates: the global phase-correlation peak (tried at both wraps of each axis, since phase
+/// correlation is cyclic and shifts beyond half the image come out wrapped by one image size),
+/// and the best peak near the recorded layout. Each is scored by [`patch_score`]. The candidate
+/// near the recorded layout wins unless another is clearly better, since the live tracker is
+/// right for most neighbours.
+fn coarse_probe(a: &Small, b: &Small, pc: &mut PhaseCorrelator, recorded: (f64, f64)) -> Option<Probe> {
     if a.w != b.w || a.h != b.h {
         return None;
     }
-    let s = pc.correlate(&a.px, &b.px);
+    let k = a.k as f64;
     let alt = |d: f64, n: usize| if d >= 0.0 { d - n as f64 } else { d + n as f64 };
-    let mut best: Option<(f64, f64, f64, f64)> = None;
-    for &dx in &[s.dx, alt(s.dx, a.w)] {
-        for &dy in &[s.dy, alt(s.dy, a.h)] {
-            let (ncc, frac) = ncc_at(a, b, dx.round() as i64, dy.round() as i64);
-            if best.map_or(true, |(_, _, n, _)| ncc > n) {
-                best = Some((dx, dy, ncc, frac));
+    let eval = |dx: f64, dy: f64, near: bool| -> Option<Probe> {
+        let (score, patches, frac) = patch_score(a, b, dx.round() as i64, dy.round() as i64)?;
+        Some(Probe { dx, dy, score, patches, frac, near_recorded: near })
+    };
+    let better = |best: &mut Option<Probe>, c: Option<Probe>| {
+        if let Some(c) = c {
+            if best.map_or(true, |b| c.score > b.score) {
+                *best = Some(c);
             }
         }
+    };
+
+    let mut best: Option<Probe> = None;
+    let s = pc.correlate(&a.px, &b.px);
+    for &dx in &[s.dx, alt(s.dx, a.w)] {
+        for &dy in &[s.dy, alt(s.dy, a.h)] {
+            better(&mut best, eval(dx, dy, false));
+        }
     }
-    best
+
+    // Best peak near the recorded layout (expected content shift d0 = -recorded / k).
+    let (d0x, d0y) = (-recorded.0 / k, -recorded.1 / k);
+    let radius = (0.12 * a.w as f64) as usize;
+    let near = pc.correlate_near(&a.px, &b.px, d0x, d0y, radius);
+    let pick = |d: f64, d0: f64, n: usize| {
+        // the reported peak is wrapped; keep the representative closest to the expectation
+        [d, alt(d, n)].into_iter().min_by(|p, q| (p - d0).abs().partial_cmp(&(q - d0).abs()).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(d)
+    };
+    let hinted = eval(pick(near.dx, d0x, a.w), pick(near.dy, d0y, a.h), true);
+
+    match (hinted, best) {
+        (Some(h), Some(g)) if h.score >= COARSE_MIN_SCORE && h.score >= g.score - 0.15 => Some(h),
+        (Some(h), Some(g)) => Some(if h.score >= g.score { h } else { g }),
+        (Some(h), None) => Some(h),
+        (None, g) => g,
+    }
 }
 
-/// Offset between two whole tiles, independent of their recorded positions: phase correlation of
-/// the reduced tiles, then verified by normalised cross-correlation of the overlap it implies.
-/// Returns `(p_j - p_i in capture px, weight)`.
-fn coarse_pair(probe: (f64, f64, f64, f64)) -> Option<((f64, f64), f64)> {
-    let (dx, dy, ncc, frac) = probe;
-    if ncc < COARSE_MIN_NCC || frac < COARSE_MIN_OVERLAP {
+/// Decides whether a probe is trustworthy: `Some((p_j - p_i in capture px, weight))`.
+fn coarse_pair(probe: &Probe, k: u32, recorded: (f64, f64), tile_min: f64) -> Option<((f64, f64), f64)> {
+    if probe.score < COARSE_MIN_SCORE || probe.patches < COARSE_MIN_PATCHES || probe.frac < COARSE_MIN_OVERLAP {
         return None;
     }
     // b(x) ≈ a(x - d)  ⇒  p_j - p_i = -d  (whole tiles: no assumed placement)
-    let k = COARSE_K as f64;
-    Some(((-dx * k, -dy * k), ncc * ncc * frac.sqrt()))
+    let t = (-probe.dx * k as f64, -probe.dy * k as f64);
+    // Far from what the live tracker recorded: demand stronger evidence.
+    let far = (t.0 - recorded.0).hypot(t.1 - recorded.1) > FAR_FROM_RECORDED * tile_min;
+    if far && (probe.score < 0.7 || probe.patches < 8) {
+        return None;
+    }
+    Some((t, probe.score * probe.score * probe.frac.sqrt()))
+}
+
+/// Mean absolute difference of `a` and `b` over their overlap at content shift `(dx, dy)`, after
+/// removing each side's mean (so a brightness offset does not count): `(error, overlap pixels)`.
+fn overlap_diff(a: &Small, b: &Small, dx: i64, dy: i64) -> Option<(f64, f64)> {
+    let (w, h) = (a.w as i64, a.h as i64);
+    let (x0, x1) = (dx.max(0), (w + dx).min(w));
+    let (y0, y1) = (dy.max(0), (h + dy).min(h));
+    if x1 - x0 < 16 || y1 - y0 < 16 {
+        return None;
+    }
+    let n = ((x1 - x0) * (y1 - y0)) as f64;
+    let (mut sa, mut sb) = (0.0f64, 0.0f64);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            sa += a.px[((y - dy) * w + x - dx) as usize] as f64;
+            sb += b.px[(y * w + x) as usize] as f64;
+        }
+    }
+    let off = (sb - sa) / n;
+    let mut err = 0.0f64;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            err += (b.px[(y * w + x) as usize] as f64 - a.px[((y - dy) * w + x - dx) as usize] as f64 - off).abs();
+        }
+    }
+    Some((err / n, n))
+}
+
+/// How well the final layout registers the tiles: overlap-weighted mean of [`overlap_diff`] over
+/// every pair that overlaps by at least 10 % of a tile.
+fn overlap_error(smalls: &[Option<Small>], positions: &[(f64, f64)]) -> Option<f64> {
+    let (mut sum, mut weight) = (0.0f64, 0.0f64);
+    for i in 0..smalls.len() {
+        for j in i + 1..smalls.len() {
+            let (Some(a), Some(b)) = (&smalls[i], &smalls[j]) else { continue };
+            if a.w != b.w || a.h != b.h {
+                continue;
+            }
+            let k = a.k as f64;
+            // b(x) ≈ a(x - d), d = -(p_j - p_i) / k
+            let d = (-(positions[j].0 - positions[i].0) / k, -(positions[j].1 - positions[i].1) / k);
+            if let Some((e, n)) = overlap_diff(a, b, d.0.round() as i64, d.1.round() as i64) {
+                if n >= 0.10 * (a.w * a.h) as f64 {
+                    sum += e * n;
+                    weight += n;
+                }
+            }
+        }
+    }
+    (weight > 0.0).then(|| sum / weight)
 }
 
 /// Solves for positions, then drops the measurements that disagree with the solution
@@ -830,8 +961,10 @@ pub fn export_session(
     // ---- 1) coarse registration: whole tiles, independent of the recorded layout
     let mut start = p0.clone();
     let mut coarse_pairs = 0;
+    let mut kept_smalls: Vec<Option<Small>> = Vec::new();
     if opts.refine && n > 1 {
         progress.set("Registering tiles", 0.0);
+        let coarse_k = opts.coarse_k.clamp(1, 8);
         let coarse_set = TileSet::new(session_dir, meta.clone(), 1.0, opts.cache_bytes);
         let smalls: Mutex<Vec<Option<Small>>> = Mutex::new((0..n).map(|_| None).collect());
         let next = AtomicUsize::new(0);
@@ -845,8 +978,8 @@ pub fn export_session(
                     }
                     match coarse_set.load(i) {
                         Ok(img) => {
-                            let g = gray_small(&img, COARSE_K);
-                            let small = Small { w: g.width() as usize, h: g.height() as usize, px: to_f32(&g) };
+                            let g = gray_small(&img, coarse_k);
+                            let small = Small { w: g.width() as usize, h: g.height() as usize, k: coarse_k, px: to_f32(&g) };
                             if let Ok(mut v) = smalls.lock() {
                                 v[i] = Some(small);
                             }
@@ -884,27 +1017,29 @@ pub fn export_session(
                         let (i, j) = cand[idx];
                         if let (Some(a), Some(b)) = (&smalls[i], &smalls[j]) {
                             let pc = pcs.entry((a.w, a.h)).or_insert_with(|| PhaseCorrelator::new_tapered(a.w, a.h, 0.15));
-                            let probe = coarse_probe(a, b, pc);
+                            let recorded = (p0[j].0 - p0[i].0, p0[j].1 - p0[i].1);
+                            let tile_min = meta[i].width.min(meta[i].height) as f64;
+                            let probe = coarse_probe(a, b, pc, recorded);
+                            let verdict = probe.as_ref().and_then(|pr| coarse_pair(pr, a.k, recorded, tile_min));
                             if debug {
-                                if let Some((dx, dy, ncc, frac)) = probe {
+                                if let Some(pr) = &probe {
                                     eprintln!(
-                                        "coarse {i:>3}-{j:>3}: shift {:>7.1},{:>7.1} px  ncc {ncc:.2}  overlap {:.0} %  recorded {:>7.1},{:>7.1}",
-                                        -dx * COARSE_K as f64,
-                                        -dy * COARSE_K as f64,
-                                        frac * 100.0,
-                                        p0[j].0 - p0[i].0,
-                                        p0[j].1 - p0[i].1
+                                        "coarse {i:>3}-{j:>3}: shift {:>7.1},{:>7.1} px  score {:.2} ({} patches)  overlap {:.0} %  {}  recorded {:>7.1},{:>7.1}  -> {}",
+                                        -pr.dx * a.k as f64,
+                                        -pr.dy * a.k as f64,
+                                        pr.score,
+                                        pr.patches,
+                                        pr.frac * 100.0,
+                                        if pr.near_recorded { "near" } else { "free" },
+                                        recorded.0,
+                                        recorded.1,
+                                        if verdict.is_some() { "accepted" } else { "rejected" }
                                     );
                                 }
                             }
-                            if let Some((t, w)) = probe.and_then(coarse_pair) {
-                                // The recorded layout can be wrong, but not absurdly so.
-                                let t0 = (p0[j].0 - p0[i].0, p0[j].1 - p0[i].1);
-                                let limit = 1.6 * (meta[i].width.min(meta[i].height)) as f64;
-                                if (t.0 - t0.0).abs() <= limit && (t.1 - t0.1).abs() <= limit {
-                                    if let Ok(mut f) = found.lock() {
-                                        f.push(PairMeasure { i, j, t, w });
-                                    }
+                            if let Some((t, w)) = verdict {
+                                if let Ok(mut f) = found.lock() {
+                                    f.push(PairMeasure { i, j, t, w });
                                 }
                             }
                         }
@@ -919,6 +1054,7 @@ pub fn export_session(
         }
         let found = found.into_inner().unwrap_or_default();
         let found_n = found.len();
+        kept_smalls = smalls;
         let (pos, kept) = solve_robust(&p0, found, 12.0);
         coarse_pairs = kept.len();
         if debug {
@@ -947,7 +1083,7 @@ pub fn export_session(
                             break;
                         }
                         let (i, j) = pairs[idx];
-                        match measure_pair(&measure_set, i, j, &start, &mut pcs) {
+                        match measure_pair(&measure_set, i, j, &start, &mut pcs, opts.fine_side.max(128) as f64) {
                             Ok((m, st)) => {
                                 if let (Some(m), Ok(mut g)) = (m, measures.lock()) {
                                     g.push(m);
@@ -988,6 +1124,8 @@ pub fn export_session(
         positions = pos;
         pairs_used = kept.len();
     }
+    let overlap_error = if kept_smalls.is_empty() { None } else { overlap_error(&kept_smalls, &positions) };
+    drop(kept_smalls);
     let max_correction = positions
         .iter()
         .zip(&p0)
@@ -1146,6 +1284,7 @@ pub fn export_session(
         pairs_used,
         max_correction,
         scale,
+        overlap_error,
     })
 }
 
@@ -1365,5 +1504,33 @@ mod tests {
         eprintln!("mean abs difference to the board: {best:.2} gray levels");
         assert!(best < 4.0, "the mosaic differs from the board by {best:.2} levels");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The top of a board is a straight edge against a flat table: it matches after *any* shift
+    /// along x. A global correlation is fooled; the patch vote is not.
+    #[test]
+    fn patch_score_rejects_a_shift_that_only_the_board_edge_supports() {
+        let scene = |x: i64, y: i64| -> f32 {
+            if y < 50 {
+                40.0 // flat table
+            } else if ((x * 37 + y * 91).rem_euclid(97)) < 7 {
+                255.0 // components
+            } else if y < 56 {
+                230.0 // bright board edge, identical at every x
+            } else {
+                120.0 + ((x * 13 + y * 7).rem_euclid(5)) as f32
+            }
+        };
+        let make = |ox: i64| Small {
+            w: 240,
+            h: 135,
+            k: 4,
+            px: (0..135).flat_map(|y| (0..240).map(move |x| (x as i64, y as i64))).map(|(x, y)| scene(x + ox, y)).collect(),
+        };
+        let (a, b) = (make(0), make(100)); // b(x) = a(x + 100)  ⇒  content shift d = -100
+        let (good, good_patches, _) = patch_score(&a, &b, -100, 0).expect("enough texture");
+        let (bad, _, _) = patch_score(&a, &b, -40, 0).expect("enough texture");
+        assert!(good > 0.9 && good_patches >= 6, "true shift scored {good:.2} on {good_patches} patches");
+        assert!(bad < 0.5, "a wrong shift scored {bad:.2}");
     }
 }

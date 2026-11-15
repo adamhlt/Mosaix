@@ -187,11 +187,12 @@ pub struct ViewportSource {
     board: RgbImage,
     view: (u32, u32),
     path: Vec<(f64, f64)>,
+    /// Pause (frames) at each waypoint.
+    pauses: Vec<u32>,
     target: usize,
     pos: (f64, f64),
     speed: f64,
     pause_left: u32,
-    pause_frames: u32,
     pacer: Option<Pacer>,
     label: String,
 }
@@ -199,28 +200,103 @@ pub struct ViewportSource {
 impl ViewportSource {
     pub fn new(board: RgbImage, view: (u32, u32), step: f64, speed: f64, pause_frames: u32, fps: Option<f32>) -> Self {
         let path = serpentine_path((board.width(), board.height()), view, step);
+        let pauses = vec![pause_frames; path.len()];
+        Self::with_path(board, view, path, pauses, speed, fps)
+    }
+
+    /// Explicit waypoints (top-left of the view, canvas pixels) with a pause at each.
+    pub fn with_path(
+        board: RgbImage,
+        view: (u32, u32),
+        path: Vec<(f64, f64)>,
+        pauses: Vec<u32>,
+        speed: f64,
+        fps: Option<f32>,
+    ) -> Self {
+        assert_eq!(path.len(), pauses.len());
         let pos = path[0];
+        let pause_left = pauses[0];
         Self {
             board,
             view,
             path,
+            pauses,
             target: 1,
             pos,
             speed,
-            pause_left: pause_frames,
-            pause_frames,
+            pause_left,
             pacer: fps.map(Pacer::new),
             label: "synthetic demo".into(),
         }
     }
 
+    /// Demo: a PCB lying on a flat table, scanned in a serpentine pattern. At the end of each
+    /// row the view overshoots the board edge and waits, so the edge detection has something to
+    /// detect; the last step goes below the board to end the map.
     pub fn demo() -> Self {
-        Self::new(synthetic_board(3200, 2000), (1280, 720), 0.68, 14.0, 15, Some(30.0))
+        let (canvas, path, pauses) = demo_scene();
+        Self::with_path(canvas, (1280, 720), path, pauses, 14.0, Some(30.0))
     }
 
     pub fn is_done(&self) -> bool {
         self.target >= self.path.len() && self.pause_left == 0
     }
+}
+
+/// Board on a table + waypoints of the demo hand. Pauses are short at ordinary waypoints and
+/// long where the view overshoots an edge (time to detect, confirm and capture the last tile).
+pub fn demo_scene() -> (RgbImage, Vec<(f64, f64)>, Vec<u32>) {
+    const VIEW: (f64, f64) = (1280.0, 720.0);
+    let (bw, bh) = (2700u32, 1700u32);
+    let (mx, my) = (560u32, 320u32); // table margin around the board
+    let mut canvas = RgbImage::from_fn(bw + 2 * mx, bh + 2 * my, |x, y| {
+        let n = ((x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) % 3) as i32 - 1;
+        Rgb([(58 + n) as u8, (60 + n) as u8, (64 + n) as u8]) // dark, flat table
+    });
+    image::imageops::replace(&mut canvas, &synthetic_board(bw, bh), mx as i64, my as i64);
+
+    let (mx, my, bw, bh) = (mx as f64, my as f64, bw as f64, bh as f64);
+    let (sx, sy) = (0.68 * VIEW.0, 0.68 * VIEW.1);
+    let x_right = mx + bw - 0.6 * VIEW.0; // 40 % of the view beyond the right edge
+    let x_left = mx - 0.4 * VIEW.0; // 40 % beyond the left edge
+    let y_bottom = my + bh - 0.6 * VIEW.1; // 40 % beyond the bottom edge
+    let (short, edge) = (15u32, 150u32);
+
+    let mut path = Vec::new();
+    let mut pauses = Vec::new();
+    let mut push = |p: (f64, f64), pause: u32| {
+        path.push(p);
+        pauses.push(pause);
+    };
+    for row in 0..3 {
+        let y = my + row as f64 * sy;
+        if row % 2 == 0 {
+            // left → right
+            let mut x = if row == 0 { mx } else { x_left };
+            if row == 0 {
+                push((x, y), short);
+            }
+            while x + sx < x_right - 1.0 {
+                x += sx;
+                push((x, y), short);
+            }
+            push((x_right, y), edge);
+            if row < 2 {
+                push((x_right, y + sy), short); // step down
+            }
+        } else {
+            // right → left
+            let mut x = x_right;
+            while x - sx > x_left + 1.0 {
+                x -= sx;
+                push((x, y), short);
+            }
+            push((x_left, y), edge);
+            push((x_left, y + sy), short); // step down
+        }
+    }
+    push((x_right, y_bottom), edge); // below the board: end of the map
+    (canvas, path, pauses)
 }
 
 impl CameraSource for ViewportSource {
@@ -240,8 +316,8 @@ impl CameraSource for ViewportSource {
             let d = dx.hypot(dy);
             if d <= self.speed {
                 self.pos = (tx, ty);
+                self.pause_left = self.pauses[self.target];
                 self.target += 1;
-                self.pause_left = self.pause_frames;
             } else {
                 self.pos = (self.pos.0 + dx / d * self.speed, self.pos.1 + dy / d * self.speed);
             }

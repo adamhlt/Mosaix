@@ -1,7 +1,9 @@
-//! Frame analysis: motion, position, sharpness, capture decision.
+//! Frame analysis: motion, position, sharpness, capture decision, guidance.
 
 use crate::capture::{CaptureMachine, Input, Params, State};
+use crate::edge::{EdgeDetector, EdgeParams};
 use crate::focus::sharpness;
+use crate::guidance::{Guide, Phase, Suggestion};
 use crate::mosaic::Mosaic;
 use crate::session::Session;
 use crate::tracking::{gray_small, to_f32, PhaseCorrelator};
@@ -10,6 +12,12 @@ use image::{GrayImage, RgbImage};
 
 /// Downscale factor for the analysis (÷4 → scale 0.25).
 pub const ANALYSIS_K: u32 = 4;
+
+/// Minimum new area (fraction of the field) since the last tile to warrant a closing capture.
+pub const CLOSING_MIN_OFFSET: f64 = 0.10;
+
+/// Seconds a suggestion stays up before it is auto-confirmed (demo mode only).
+const AUTO_CONFIRM_SECS: f64 = 1.0;
 
 /// Reference tile for absolute tracking.
 struct TileRef {
@@ -36,9 +44,14 @@ pub struct Report {
     /// Quality of the frame-to-frame correlation peak.
     pub peak: f32,
     pub analysis_ms: f32,
-    /// Direction (unit axis vector) the camera should move next, in board coordinates.
-    /// Derived from the last two tiles; defaults to +x.
-    pub heading: (f64, f64),
+    /// Direction (unit axis vector) the camera should move next, `None` once the map is finished.
+    pub heading: Option<(f64, f64)>,
+    pub phase: Phase,
+    /// Edge detected automatically and waiting for the user's confirmation.
+    pub suggestion: Option<Suggestion>,
+    pub rows_done: usize,
+    pub finished: bool,
+    pub auto_detect: bool,
 }
 
 pub struct Analyzer {
@@ -46,9 +59,16 @@ pub struct Analyzer {
     prev: Option<Vec<f32>>,
     tiles: Vec<TileRef>,
     pos: (f64, f64),
+    last_offset_frac: f64,
     pub machine: CaptureMachine,
     pub mosaic: Mosaic,
     pub session: Option<Session>,
+    pub guide: Guide,
+    pub edge: EdgeDetector,
+    /// Automatic edge detection (suggestions); manual controls always work.
+    pub auto_detect: bool,
+    /// Confirm suggestions by itself after a short delay (demo source, no one to click).
+    pub auto_confirm: bool,
 }
 
 impl Analyzer {
@@ -58,9 +78,14 @@ impl Analyzer {
             prev: None,
             tiles: Vec::new(),
             pos: (0.0, 0.0),
+            last_offset_frac: 0.0,
             machine: CaptureMachine::new(params),
             mosaic: Mosaic::new(),
             session,
+            guide: Guide::default(),
+            edge: EdgeDetector::new(EdgeParams::default()),
+            auto_detect: true,
+            auto_confirm: false,
         }
     }
 
@@ -79,6 +104,52 @@ impl Analyzer {
         }
         self.machine.reset_stability();
         Ok(true)
+    }
+
+    // ---- guidance controls (automatic suggestions and their manual fallbacks) ----
+
+    /// Is there new area since the last tile that a closing capture would cover?
+    fn needs_closing(&self) -> bool {
+        !self.tiles.is_empty() && self.last_offset_frac >= CLOSING_MIN_OFFSET
+    }
+
+    /// Manual: the row ends here.
+    pub fn end_row(&mut self) {
+        let nc = self.needs_closing();
+        self.guide.end_row(nc);
+        self.edge.dismiss();
+    }
+
+    /// Manual: the map is complete.
+    pub fn finish(&mut self) {
+        let nc = self.needs_closing();
+        self.guide.finish(nc);
+        self.edge.dismiss();
+    }
+
+    /// Manual: flip the row direction.
+    pub fn reverse(&mut self) {
+        self.guide.reverse();
+    }
+
+    /// Manual: resume after a finish.
+    pub fn resume(&mut self) {
+        self.guide.resume();
+        self.edge.rearm();
+    }
+
+    /// Accept the pending automatic suggestion.
+    pub fn confirm(&mut self) {
+        match self.guide.suggestion_kind() {
+            Some(Suggestion::EndRow) => self.end_row(),
+            Some(Suggestion::Finish) => self.finish(),
+            None => {}
+        }
+    }
+
+    /// Reject the pending automatic suggestion (no new one until the next capture).
+    pub fn dismiss(&mut self) {
+        self.edge.dismiss();
     }
 
     pub fn process(&mut self, frame: &RgbImage, t: f64) -> Result<Report> {
@@ -123,38 +194,65 @@ impl Analyzer {
 
         // 3) decision
         let frame_size = (frame.width(), frame.height());
+        let fsz = (frame_size.0 as f64, frame_size.1 as f64);
         let offset = self.tiles.last().map(|tr| (self.pos.0 - tr.pos.0, self.pos.1 - tr.pos.1));
+        let off_frac = offset.map_or(0.0, |(dx, dy)| (dx.abs() / fsz.0).max(dy.abs() / fsz.1));
+        self.last_offset_frac = off_frac;
         let motion_px = match motion {
             Some((dx, dy)) => dx.hypot(dy),
             None if first => 0.0,
             None => f64::INFINITY,
         };
+
+        // Closing capture: after a confirmed row/map end, grab the last tile as soon as the
+        // image is stable and sharp, wherever it is. If there is nothing new, skip it.
+        if matches!(self.guide.phase, Phase::Closing(_)) && off_frac < CLOSING_MIN_OFFSET {
+            self.guide.closing_done();
+        }
+        let force_far = matches!(self.guide.phase, Phase::Closing(_));
         let d = self.machine.update(&Input {
             t,
             motion_px,
             tracking_ok: motion.is_some() || tile_ok || first,
             offset,
-            frame: (frame_size.0 as f64, frame_size.1 as f64),
+            frame: fsz,
             sharp,
+            force_far,
         });
 
         // 4) capture
-        if d.capture {
+        let capture = d.capture && !self.guide.finished;
+        if capture {
             if let Some(s) = &mut self.session {
                 s.add_tile(frame, self.pos)?;
             }
             self.mosaic.add(frame, self.pos);
-            self.tiles.push(TileRef { gray, pos: self.pos });
+            self.tiles.push(TileRef { gray: gray.clone(), pos: self.pos });
+            self.guide.tile_captured();
+            self.edge.rearm();
         }
 
-        let n = self.tiles.len();
-        let heading = if n >= 2 {
-            let (a, b) = (self.tiles[n - 2].pos, self.tiles[n - 1].pos);
-            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-            if dx.abs() >= dy.abs() { (dx.signum(), 0.0) } else { (0.0, dy.signum()) }
-        } else {
-            (1.0, 0.0)
+        // 5) automatic edge detection → suggestion (the user confirms)
+        let heading = self.guide.heading();
+        let can_suggest = self.auto_detect
+            && !self.tiles.is_empty()
+            && self.guide.suggestion_kind().is_some()
+            && d.state != State::Capture;
+        let suggested = match heading {
+            Some(hd) if can_suggest => self.edge.update(&gray, hd, t, true),
+            _ => {
+                self.edge.idle();
+                false
+            }
         };
+        if suggested && self.auto_confirm {
+            if let Some(at) = self.edge.suggested_at() {
+                if t - at >= AUTO_CONFIRM_SECS {
+                    self.confirm();
+                }
+            }
+        }
+        let suggestion = if suggested { self.guide.suggestion_kind() } else { None };
 
         Ok(Report {
             state: d.state,
@@ -166,10 +264,15 @@ impl Analyzer {
             offset_frac: d.offset_frac,
             tiles: self.tiles.len(),
             frame_size,
-            captured: d.capture,
+            captured: capture,
             peak,
             analysis_ms: t0.elapsed().as_secs_f32() * 1000.0,
-            heading,
+            heading: self.guide.heading(),
+            phase: self.guide.phase,
+            suggestion,
+            rows_done: self.guide.rows_done,
+            finished: self.guide.finished,
+            auto_detect: self.auto_detect,
         })
     }
 }
@@ -177,7 +280,7 @@ impl Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::camera::{serpentine_path, synthetic_board, CameraSource, ViewportSource};
+    use crate::camera::{demo_scene, serpentine_path, synthetic_board, CameraSource, ViewportSource};
 
     /// Full run over the synthetic board (dimensions chosen so that the last step
     /// of each row/column also exceeds the 65 % threshold): the machine must capture about
@@ -226,5 +329,58 @@ mod tests {
         assert!(an.undo_last().unwrap());
         assert_eq!(an.tile_count(), 1);
         assert_eq!(an.mosaic.len(), 1);
+    }
+
+    /// The demo hand overshoots every board edge: the detector must suggest the row ends and
+    /// the final step, the analyzer (auto-confirming) must walk the whole serpentine and finish.
+    #[test]
+    fn demo_run_detects_edges_and_finishes() {
+        let (canvas, path, pauses) = demo_scene();
+        let mut src = ViewportSource::with_path(canvas, (1280, 720), path, pauses, 14.0, None);
+        let mut an = Analyzer::new(Params::default(), None);
+        an.auto_confirm = true;
+        let (mut i, mut suggestion_frames, mut last) = (0u32, 0u32, None);
+        while let Some(f) = src.next_frame().unwrap() {
+            let r = an.process(&f, i as f64 / 30.0).unwrap();
+            if r.suggestion.is_some() {
+                suggestion_frames += 1;
+            }
+            if r.captured {
+                eprintln!("i={i} tile #{} at ({:.0},{:.0}) phase={:?} rows={}", r.tiles, r.pos.0, r.pos.1, r.phase, r.rows_done);
+            }
+            last = Some(r);
+            i += 1;
+        }
+        let r = last.unwrap();
+        eprintln!("{} frames, {} tiles, {} rows, finished={}, suggestion frames={}", i, r.tiles, r.rows_done, r.finished, suggestion_frames);
+        assert!(suggestion_frames > 0, "the detector never suggested anything");
+        assert!(r.finished, "the map was not finished");
+        assert_eq!(r.rows_done, 3);
+        assert!(r.tiles >= 12, "only {} tiles", r.tiles);
+    }
+
+    /// Without auto-confirm nothing advances by itself; the manual fallbacks work.
+    #[test]
+    fn manual_controls_drive_the_guide() {
+        let (canvas, path, pauses) = demo_scene();
+        let mut src = ViewportSource::with_path(canvas, (1280, 720), path, pauses, 14.0, None);
+        let mut an = Analyzer::new(Params::default(), None);
+        an.auto_detect = false; // fully manual: no suggestion may ever appear
+        let mut i = 0u32;
+        let mut ended_row = false;
+        while let Some(f) = src.next_frame().unwrap() {
+            let r = an.process(&f, i as f64 / 30.0).unwrap();
+            assert!(r.suggestion.is_none());
+            // At the first row end (long pause, offset since the last tile), the user presses "end row"
+            // (the state reads `Move` there: the offset is below the 65 % trigger, so only stability counts)
+            if !ended_row && r.tiles >= 3 && r.offset_frac > 0.1 && r.stable_secs > 1.0 {
+                an.end_row();
+                ended_row = true;
+            }
+            i += 1;
+        }
+        assert!(ended_row, "the row end was never reached");
+        assert!(an.guide.rows_done >= 1, "the manual end-of-row did not advance the guide");
+        assert!(an.tile_count() >= 5, "the closing capture and the next row were not captured");
     }
 }

@@ -29,6 +29,20 @@ pub enum Event {
 pub enum Control {
     Pause(bool),
     UndoLast,
+    /// Manual: the row ends here.
+    EndRow,
+    /// Manual: the map is complete.
+    Finish,
+    /// Manual: flip the row direction.
+    Reverse,
+    /// Accept the pending automatic suggestion.
+    Confirm,
+    /// Reject the pending automatic suggestion.
+    Dismiss,
+    /// Resume mapping after a finish.
+    Resume,
+    /// Turn automatic edge detection on or off.
+    AutoDetect(bool),
     Stop,
 }
 
@@ -66,6 +80,8 @@ impl Pipeline {
         let (ctrl_tx, ctrl_rx) = unbounded::<Control>();
         let wake = Arc::new(wake);
         let stop = Arc::new(AtomicBool::new(false));
+        // The demo source has no one to click: let it confirm suggestions by itself.
+        let auto_confirm = matches!(spec, SourceSpec::Synthetic);
 
         // Capture thread: reads the source and publishes the latest frame.
         {
@@ -130,6 +146,7 @@ impl Pipeline {
                         }
                     });
                     let mut an = Analyzer::new(params, session);
+                    an.auto_confirm = auto_confirm;
                     let t0 = Instant::now();
                     let mut paused = false;
                     let mut force_preview = false;
@@ -147,6 +164,13 @@ impl Pipeline {
                                     Ok(_) => force_preview = true,
                                     Err(e) => tracing::error!("undo: {e:#}"),
                                 },
+                                Control::EndRow => an.end_row(),
+                                Control::Finish => an.finish(),
+                                Control::Reverse => an.reverse(),
+                                Control::Confirm => an.confirm(),
+                                Control::Dismiss => an.dismiss(),
+                                Control::Resume => an.resume(),
+                                Control::AutoDetect(on) => an.auto_detect = on,
                                 Control::Stop => return,
                             }
                         }
@@ -216,6 +240,11 @@ fn empty_report(frame: &RgbImage, tiles: usize) -> Report {
         captured: false,
         peak: 0.0,
         analysis_ms: 0.0,
-        heading: (1.0, 0.0),
+        heading: Some((1.0, 0.0)),
+        phase: crate::guidance::Phase::Row,
+        suggestion: None,
+        rows_done: 0,
+        finished: false,
+        auto_detect: true,
     }
 }

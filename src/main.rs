@@ -3,11 +3,13 @@
 //!
 //! CLI flags skip the menu: `--demo`, `--replay <dir> [--fps N]`,
 //! `--camera <index> [--res WxH] [--yuyv]`. `--no-save` disables session saving.
-//! UI testing without any source: `--fake stabilize|move|lost` shows a frozen state.
+//! UI testing without any source: `--fake stabilize|move|lost|suggest-row|suggest-finish|closing|finished`
+//! shows a frozen state.
 
 use pcb_mapper::analysis::Report;
 use pcb_mapper::camera::SourceSpec;
 use pcb_mapper::capture::{Params, State as CaptureState};
+use pcb_mapper::guidance::{Phase, Suggestion, Then};
 use pcb_mapper::mosaic::Preview;
 use pcb_mapper::pipeline::{Control, Event, Pipeline};
 use rune::tok::{self, type_};
@@ -75,6 +77,7 @@ struct App {
     paused: bool,
     ended: Option<String>,
     details_open: bool,
+    auto_detect: bool,
     initial: Option<(SourceSpec, bool)>,
     fps_frames: u32,
     fps_t0: f64,
@@ -121,10 +124,21 @@ fn apply_fake(app: &mut App, kind: &str) {
         app.mosaic.set(pv.image.width(), pv.image.height(), pv.image.as_raw().clone());
         app.preview = Some(Arc::new(pv));
     }
-    let (state, offset, stable, sharp_rel) = match kind {
-        "move" => (CaptureState::Move, 0.42, 0.0, 0.92),
-        "lost" => (CaptureState::Lost, 0.30, 0.0, 0.41),
-        _ => (CaptureState::Stabilizing, 0.68, 0.18, 0.96),
+    let (state, offset, stable, sharp_rel, phase, suggestion, finished) = match kind {
+        "move" => (CaptureState::Move, 0.42, 0.0, 0.92, Phase::Row, None, false),
+        "lost" => (CaptureState::Lost, 0.30, 0.0, 0.41, Phase::Row, None, false),
+        "suggest-row" => (CaptureState::Move, 0.40, 0.0, 0.95, Phase::Row, Some(Suggestion::EndRow), false),
+        "suggest-finish" => (CaptureState::Move, 0.40, 0.0, 0.95, Phase::Down, Some(Suggestion::Finish), false),
+        "closing" => (CaptureState::Stabilizing, 0.22, 0.12, 0.96, Phase::Closing(Then::StepDown), None, false),
+        "finished" => (CaptureState::Tracking, 0.15, 0.0, 0.96, Phase::Row, None, true),
+        _ => (CaptureState::Stabilizing, 0.68, 0.18, 0.96, Phase::Row, None, false),
+    };
+    let heading = if finished {
+        None
+    } else if phase == Phase::Down {
+        Some((0.0, 1.0))
+    } else {
+        Some((1.0, 0.0))
     };
     app.report = Some(Report {
         state,
@@ -139,7 +153,12 @@ fn apply_fake(app: &mut App, kind: &str) {
         captured: false,
         peak: 0.3,
         analysis_ms: 2.8,
-        heading: (1.0, 0.0),
+        heading,
+        phase,
+        suggestion,
+        rows_done: 1,
+        finished,
+        auto_detect: true,
     });
     app.screen = Screen::Running;
 }
@@ -160,6 +179,7 @@ fn state() -> App {
         paused: false,
         ended: None,
         details_open: true,
+        auto_detect: true,
         initial: spec.map(|s| (s, save)),
         fps_frames: 0,
         fps_t0: 0.0,
@@ -201,6 +221,7 @@ fn start(s: &mut App, spec: SourceSpec) {
     s.report = None;
     s.preview = None;
     s.paused = false;
+    s.auto_detect = true;
     s.ended = None;
     let root = s.menu.save.then(|| PathBuf::from("sessions"));
     s.pipeline = Some(Pipeline::start(spec, root, Params::default(), 1600, move || waker()));
@@ -269,6 +290,34 @@ fn undo(s: &mut App) {
     }
 }
 
+fn send(s: &App, c: Control) {
+    if let Some(p) = &s.pipeline {
+        p.send(c);
+    }
+}
+fn end_row(s: &mut App) {
+    send(s, Control::EndRow);
+}
+fn finish(s: &mut App) {
+    send(s, Control::Finish);
+}
+fn reverse(s: &mut App) {
+    send(s, Control::Reverse);
+}
+fn confirm(s: &mut App) {
+    send(s, Control::Confirm);
+}
+fn dismiss(s: &mut App) {
+    send(s, Control::Dismiss);
+}
+fn resume(s: &mut App) {
+    send(s, Control::Resume);
+}
+fn toggle_auto(s: &mut App) {
+    s.auto_detect = !s.auto_detect;
+    send(s, Control::AutoDetect(s.auto_detect));
+}
+
 fn on_key(s: &mut App, event: &KeyEvent, _: &mut Tx) -> bool {
     if s.screen != Screen::Running {
         return false;
@@ -276,6 +325,18 @@ fn on_key(s: &mut App, event: &KeyEvent, _: &mut Tx) -> bool {
     match &event.key {
         Key::Text(t) if t == " " => toggle_pause(s),
         Key::Text(t) if t == "u" => undo(s),
+        Key::Text(t) if t == "e" => end_row(s),
+        Key::Text(t) if t == "f" => {
+            if s.report.as_ref().is_some_and(|r| r.finished) {
+                resume(s)
+            } else {
+                finish(s)
+            }
+        }
+        Key::Text(t) if t == "r" => reverse(s),
+        Key::Text(t) if t == "a" => toggle_auto(s),
+        Key::Enter => confirm(s),
+        Key::Escape => dismiss(s),
         _ => return false,
     }
     true
@@ -483,16 +544,16 @@ fn state_color(st: CaptureState) -> Color {
     }
 }
 
-/// Direction the user must push the board: opposite of the camera heading.
-fn push_dir(h: (f64, f64)) -> &'static str {
+/// Name of the direction the view must move toward (the camera heading).
+fn heading_name(h: (f64, f64)) -> &'static str {
     if h.0 > 0.5 {
-        "left"
-    } else if h.0 < -0.5 {
         "right"
+    } else if h.0 < -0.5 {
+        "left"
     } else if h.1 > 0.5 {
-        "up"
-    } else {
         "down"
+    } else {
+        "up"
     }
 }
 
@@ -500,12 +561,26 @@ fn hint_text(s: &App, r: &Report) -> String {
     if s.paused {
         return "Paused".into();
     }
+    if r.finished {
+        return format!("Mapping complete — {} tiles", r.tiles);
+    }
+    match r.suggestion {
+        Some(Suggestion::EndRow) => return "End of row detected?".into(),
+        Some(Suggestion::Finish) => return "Bottom edge detected — finish the map?".into(),
+        None => {}
+    }
+    if matches!(r.phase, Phase::Closing(_)) {
+        return "Hold still — capturing the end".into();
+    }
     match r.state {
         CaptureState::Tracking if r.sharp_rel < 0.8 => "Image is soft — adjust focus".into(),
         CaptureState::Tracking => "Tracking".into(),
         CaptureState::Stabilizing => "Hold still…".into(),
         CaptureState::Capture => "Captured".into(),
-        CaptureState::Move => format!("Push the board {}", push_dir(r.heading)),
+        CaptureState::Move => match r.heading {
+            Some(h) => format!("Move {}", heading_name(h)),
+            None => "Move".into(),
+        },
         CaptureState::Lost => "Tracking lost — go back to an area already captured".into(),
     }
 }
@@ -565,9 +640,9 @@ fn reticle(r: &Report, paused: bool) -> El {
             .line([c, c - 24.0], [c, c - 6.0], w, rune::LineCap::Butt, col)
             .line([c, c + 6.0], [c, c + 24.0], w, rune::LineCap::Butt, col);
     }
-    if r.state == CaptureState::Move && !paused {
-        // Arrow = direction the board moves on screen (opposite of the camera heading).
-        let d = (-r.heading.0 as f32, -r.heading.1 as f32);
+    if let (CaptureState::Move, Some(h), false) = (r.state, r.heading, paused) {
+        // Arrow = where to go: the direction the view must move toward.
+        let d = (h.0 as f32, h.1 as f32);
         shape = shape.fill(arrow(d, 3.0), dark).fill(arrow(d, 0.0), Color::WHITE);
     }
     canvas(shape).size(RETICLE, RETICLE)
@@ -578,9 +653,22 @@ fn live_overlay(s: &App) -> El {
         return el();
     };
     let color = if s.paused { dim() } else { state_color(r.state) };
-    let hint = row().w_full().center().child(
-        el().padding(8.0).radius(16.0).fill(chip_bg()).child(text(hint_text(s, r)).font(type_::BODY).color(color)),
-    );
+    let hint = if r.suggestion.is_some() && !s.paused {
+        // Automatic detection waiting for the user: confirm or dismiss.
+        row().w_full().center().child(
+            el().padding(10.0).radius(16.0).fill(chip_bg()).child(
+                row()
+                    .gap(12.0)
+                    .child(text(hint_text(s, r)).font(type_::BODY).color(amber()))
+                    .child(primary("confirm", "Confirm (Enter)", confirm))
+                    .child(button("dismiss".into(), "Dismiss (Esc)".into(), dismiss)),
+            ),
+        )
+    } else {
+        row().w_full().center().child(
+            el().padding(8.0).radius(16.0).fill(chip_bg()).child(text(hint_text(s, r)).font(type_::BODY).color(color)),
+        )
+    };
     let stab = (r.stable_secs / 0.25).clamp(0.0, 1.0) as f32;
     let sharp_color = if r.sharp_rel < 0.8 { red() } else { green() };
     let bar = row()
@@ -711,6 +799,7 @@ fn running_view(s: &App) -> El {
         );
         if s.details_open {
             details = details
+                .child(kv("Row", format!("{}", r.rows_done + 1)))
                 .child(kv("Position", format!("{:.0}, {:.0} px", r.pos.0, r.pos.1)))
                 .child(kv("Offset from last tile", format!("{:.0} %", r.offset_frac * 100.0)))
                 .child(kv("Raw sharpness", format!("{:.0}", r.sharp)))
@@ -722,7 +811,31 @@ fn running_view(s: &App) -> El {
         panel = panel.child(text("Opening source…".to_string()).font(type_::BODY).color(dim()));
     }
 
-    panel = panel.child(spacer()).child(
+    let finished = s.report.as_ref().is_some_and(|r| r.finished);
+    let stop_btn = if finished {
+        primary("resume", "Resume (F)", resume)
+    } else {
+        button("finish".into(), "Finish (F)".into(), finish)
+    };
+    let guidance = col()
+        .w_full()
+        .gap(8.0)
+        .child(text("Guidance".to_string()).font(type_::BODY).color(dim()))
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .child(button("end-row".into(), "End row (E)".into(), end_row))
+                .child(button("reverse".into(), "Reverse (R)".into(), reverse))
+                .child(stop_btn),
+        )
+        .child(choice(
+            "auto".into(),
+            format!("Auto-detect edges: {} (A)", if s.auto_detect { "on" } else { "off" }),
+            s.auto_detect,
+            toggle_auto,
+        ));
+    panel = panel.child(spacer()).child(guidance).child(
         col()
             .w_full()
             .gap(8.0)

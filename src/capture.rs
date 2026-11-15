@@ -60,6 +60,8 @@ pub struct Input {
     pub frame: (f64, f64),
     /// Sharpness of the current frame.
     pub sharp: f32,
+    /// Capture as soon as stable and sharp, whatever the offset (closing capture of a row/map).
+    pub force_far: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,7 +120,7 @@ impl CaptureMachine {
         let stable_secs = self.stable_since.map_or(0.0, |t0| i.t - t0);
 
         let offset_frac = i.offset.map_or(0.0, |(dx, dy)| (dx.abs() / i.frame.0).max(dy.abs() / i.frame.1));
-        let far_enough = i.offset.is_none() || offset_frac >= p.trigger_frac;
+        let far_enough = i.offset.is_none() || i.force_far || offset_frac >= p.trigger_frac;
 
         let mut capture = false;
         let state = if lost {
@@ -147,7 +149,7 @@ mod tests {
     use super::*;
 
     fn input(t: f64, motion: f64, offset: Option<(f64, f64)>, sharp: f32) -> Input {
-        Input { t, motion_px: motion, tracking_ok: true, offset, frame: (1000.0, 600.0), sharp }
+        Input { t, motion_px: motion, tracking_ok: true, offset, frame: (1000.0, 600.0), sharp, force_far: false }
     }
 
     #[test]
@@ -189,6 +191,20 @@ mod tests {
         assert_eq!(d.state, State::Stabilizing);
         let d = m.update(&input(1.4, 0.0, Some((680.0, 0.0)), 100.0));
         assert!(d.capture);
+    }
+
+    #[test]
+    fn force_far_captures_without_offset() {
+        let mut m = CaptureMachine::new(Params::default());
+        m.update(&input(0.0, 0.0, None, 100.0));
+        assert!(m.update(&input(0.3, 0.0, None, 100.0)).capture);
+        let mut i = input(1.0, 0.0, Some((120.0, 0.0)), 100.0);
+        assert!(!m.update(&i).capture);
+        i.t = 1.3;
+        assert!(!m.update(&i).capture);
+        i.t = 1.4;
+        i.force_far = true;
+        assert!(m.update(&i).capture);
     }
 
     #[test]

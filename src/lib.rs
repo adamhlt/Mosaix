@@ -3,7 +3,9 @@
 pub mod analysis;
 pub mod camera;
 pub mod capture;
+pub mod edge;
 pub mod focus;
+pub mod guidance;
 pub mod mosaic;
 pub mod session;
 pub mod tracking;

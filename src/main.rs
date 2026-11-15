@@ -4,14 +4,14 @@
 //! `--camera <index> [--res WxH] [--yuyv]` skips the start menu.
 //! Headless export of a saved session: `--export <session_dir> <out.png|jpg|tif> [--scale 0.5]
 //! [--crop] [--no-refine]`.
-//! UI testing without any source: `--fake stabilize|move|lost|suggest-row|suggest-finish|closing|finished|dialog`
+//! UI testing without any source: `--fake stabilize|move|edge-ahead|lost|closing|row-ended|down|finished|dialog`
 //! shows a frozen state.
 
 use pcb_mapper::analysis::Report;
 use pcb_mapper::camera::{Mode, PixelFormat, SourceSpec};
 use pcb_mapper::capture::{Params, State as CaptureState};
 use pcb_mapper::export::{export_session, ExportOptions, ExportResult, Format, Progress};
-use pcb_mapper::guidance::{Phase, Suggestion, Then};
+use pcb_mapper::guidance::{AutoStep, Phase, Then};
 use pcb_mapper::mosaic::Preview;
 use pcb_mapper::pipeline::{Control, Event, Pipeline};
 use rune::tok::{self, type_};
@@ -150,14 +150,15 @@ fn apply_fake(app: &mut App, kind: &str) {
         app.mosaic.set(pv.image.width(), pv.image.height(), pv.image.as_raw().clone());
         app.preview = Some(Arc::new(pv));
     }
-    let (state, offset, stable, sharp_rel, phase, suggestion, finished) = match kind {
-        "move" => (CaptureState::Move, 0.42, 0.0, 0.92, Phase::Row, None, false),
-        "lost" => (CaptureState::Lost, 0.30, 0.0, 0.41, Phase::Row, None, false),
-        "suggest-row" => (CaptureState::Move, 0.40, 0.0, 0.95, Phase::Row, Some(Suggestion::EndRow), false),
-        "suggest-finish" => (CaptureState::Move, 0.40, 0.0, 0.95, Phase::Down, Some(Suggestion::Finish), false),
-        "closing" => (CaptureState::Stabilizing, 0.22, 0.12, 0.96, Phase::Closing(Then::StepDown), None, false),
-        "finished" => (CaptureState::Tracking, 0.15, 0.0, 0.96, Phase::Row, None, true),
-        _ => (CaptureState::Stabilizing, 0.68, 0.18, 0.96, Phase::Row, None, false),
+    // (state, offset, stability, sharpness, phase, table seen ahead, automatic step, finished)
+    let (state, offset, stable, sharp_rel, phase, edge_ahead, auto_step, finished) = match kind {
+        "move" => (CaptureState::Move, 0.42, 0.0, 0.92, Phase::Row, 0.0, None, false),
+        "edge-ahead" => (CaptureState::Move, 0.40, 0.0, 0.95, Phase::Row, 0.12, None, false),
+        "lost" => (CaptureState::Lost, 0.30, 0.0, 0.41, Phase::Row, 0.0, None, false),
+        "closing" => (CaptureState::Stabilizing, 0.22, 0.12, 0.96, Phase::Closing(Then::StepDown), 0.0, Some(AutoStep::RowEnded), false),
+        "row-ended" | "down" => (CaptureState::Move, 0.12, 0.0, 0.96, Phase::Down, 0.0, Some(AutoStep::RowEnded), false),
+        "finished" => (CaptureState::Tracking, 0.15, 0.0, 0.96, Phase::Row, 0.0, Some(AutoStep::MapFinished), true),
+        _ => (CaptureState::Stabilizing, 0.68, 0.18, 0.96, Phase::Row, 0.0, None, false),
     };
     let heading = if finished {
         None
@@ -180,8 +181,10 @@ fn apply_fake(app: &mut App, kind: &str) {
         peak: 0.3,
         analysis_ms: 2.8,
         heading,
+        row_dir: 1.0,
         phase,
-        suggestion,
+        edge_ahead,
+        auto_step,
         rows_done: 1,
         finished,
         auto_detect: true,
@@ -514,11 +517,8 @@ fn finish(s: &mut App) {
 fn reverse(s: &mut App) {
     send(s, Control::Reverse);
 }
-fn confirm(s: &mut App) {
-    send(s, Control::Confirm);
-}
-fn dismiss(s: &mut App) {
-    send(s, Control::Dismiss);
+fn not_edge(s: &mut App) {
+    send(s, Control::NotEdge);
 }
 fn resume(s: &mut App) {
     send(s, Control::Resume);
@@ -545,8 +545,7 @@ fn on_key(s: &mut App, event: &KeyEvent, _: &mut Tx) -> bool {
         }
         Key::Text(t) if t == "r" => reverse(s),
         Key::Text(t) if t == "a" => toggle_auto(s),
-        Key::Enter => confirm(s),
-        Key::Escape => dismiss(s),
+        Key::Escape => not_edge(s),
         _ => return false,
     }
     true
@@ -611,17 +610,6 @@ fn kv(label: &str, value: String) -> El {
         .child(text(label.to_string()).font(type_::BODY).color(dim()))
         .child(spacer())
         .child(text(value).font(type_::BODY).color(soft()))
-}
-
-fn tile(label: &str, value: String) -> El {
-    col()
-        .grow(1.0)
-        .gap(2.0)
-        .padding(8.0)
-        .radius(8.0)
-        .fill(card())
-        .child(text(label.to_string()).font(type_::BODY).color(dim()))
-        .child(text(value).font(type_::TITLE).color(Color::WHITE))
 }
 
 // ---------------------------------------------------------------- export widgets
@@ -903,44 +891,69 @@ fn state_color(st: CaptureState) -> Color {
     }
 }
 
-/// Name of the direction the view must move toward (the camera heading).
-fn heading_name(h: (f64, f64)) -> &'static str {
-    if h.0 > 0.5 {
-        "right"
-    } else if h.0 < -0.5 {
-        "left"
-    } else if h.1 > 0.5 {
-        "down"
-    } else {
-        "up"
+/// The next thing to do: a short instruction and a line explaining it.
+fn next_step(s: &App, r: &Report) -> (String, String) {
+    let row = r.rows_done + 1;
+    let along = if r.row_dir > 0.0 { "RIGHT" } else { "LEFT" };
+    if s.paused {
+        return ("Paused".into(), "Press Space to resume.".into());
+    }
+    if r.finished {
+        let why = if r.auto_step == Some(AutoStep::MapFinished) {
+            "The table showed up below the last row. Not the bottom edge? Press Esc."
+        } else {
+            "Export the mosaic, or press F to keep mapping."
+        };
+        return (format!("Map complete — {} tiles", r.tiles), why.into());
+    }
+    if r.state == CaptureState::Lost {
+        return ("Tracking lost".into(), "Move back over an area already captured.".into());
+    }
+    match r.phase {
+        Phase::Closing(Then::StepDown) => {
+            return ("Board edge reached — hold still".into(), format!("Capturing the last tile of row {row}."))
+        }
+        Phase::Closing(Then::Finish) => {
+            return ("Bottom edge reached — hold still".into(), "Capturing the last tile of the map.".into())
+        }
+        Phase::Down => {
+            let next = if r.row_dir > 0.0 { "LEFT" } else { "RIGHT" };
+            return (
+                format!("Row {} done — move DOWN one step", r.rows_done),
+                format!("Row {row} will run to the {next}. If the table shows below, the map ends by itself."),
+            );
+        }
+        Phase::Row => {}
+    }
+    if r.tiles == 0 {
+        return (
+            "Hold still for the first tile".into(),
+            "Start at the top-left corner of the board. Rows end by themselves at the board edge.".into(),
+        );
+    }
+    match r.state {
+        CaptureState::Stabilizing => ("Hold still…".into(), format!("Capturing tile {}.", r.tiles + 1)),
+        CaptureState::Capture => (format!("Tile {} captured", r.tiles), format!("Row {row}: keep moving {along}.")),
+        CaptureState::Tracking if r.sharp_rel < 0.8 => {
+            ("Image is soft — adjust the focus".into(), "Capture waits for a sharp image.".into())
+        }
+        _ if r.edge_ahead > 0.0 => {
+            (format!("Row {row}: board edge ahead"), format!("Keep moving {along}; the row ends by itself."))
+        }
+        _ => (format!("Row {row}: move {along}"), "A tile is captured each time you pause after a step.".into()),
     }
 }
 
-fn hint_text(s: &App, r: &Report) -> String {
+/// Colour of the instruction: guidance steps in amber, the map done in green, else the capture state.
+fn step_color(s: &App, r: &Report) -> Color {
     if s.paused {
-        return "Paused".into();
-    }
-    if r.finished {
-        return format!("Mapping complete — {} tiles", r.tiles);
-    }
-    match r.suggestion {
-        Some(Suggestion::EndRow) => return "End of row detected?".into(),
-        Some(Suggestion::Finish) => return "Bottom edge detected — finish the map?".into(),
-        None => {}
-    }
-    if matches!(r.phase, Phase::Closing(_)) {
-        return "Hold still — capturing the end".into();
-    }
-    match r.state {
-        CaptureState::Tracking if r.sharp_rel < 0.8 => "Image is soft — adjust focus".into(),
-        CaptureState::Tracking => "Tracking".into(),
-        CaptureState::Stabilizing => "Hold still…".into(),
-        CaptureState::Capture => "Captured".into(),
-        CaptureState::Move => match r.heading {
-            Some(h) => format!("Move {}", heading_name(h)),
-            None => "Move".into(),
-        },
-        CaptureState::Lost => "Tracking lost — go back to an area already captured".into(),
+        dim()
+    } else if r.finished {
+        green()
+    } else if r.state != CaptureState::Lost && (r.phase != Phase::Row || r.edge_ahead > 0.0) {
+        amber()
+    } else {
+        state_color(r.state)
     }
 }
 
@@ -1011,23 +1024,12 @@ fn live_overlay(s: &App) -> El {
     let Some(r) = &s.report else {
         return el();
     };
-    let color = if s.paused { dim() } else { state_color(r.state) };
-    let hint = if r.suggestion.is_some() && !s.paused {
-        // Automatic detection waiting for the user: confirm or dismiss.
-        row().w_full().center().child(
-            el().padding(10.0).radius(16.0).fill(chip_bg()).child(
-                row()
-                    .gap(12.0)
-                    .child(text(hint_text(s, r)).font(type_::BODY).color(amber()))
-                    .child(primary("confirm", "Confirm (Enter)", confirm))
-                    .child(button("dismiss".into(), "Dismiss (Esc)".into(), dismiss)),
-            ),
-        )
-    } else {
-        row().w_full().center().child(
-            el().padding(8.0).radius(16.0).fill(chip_bg()).child(text(hint_text(s, r)).font(type_::BODY).color(color)),
-        )
-    };
+    let mut chip = row().gap(12.0).child(text(next_step(s, r).0).font(type_::BODY).color(step_color(s, r)));
+    if r.auto_step.is_some() && !s.paused {
+        // The row (or map) was ended automatically: one click undoes it.
+        chip = chip.child(button("not-edge-live".into(), "Not the edge (Esc)".into(), not_edge));
+    }
+    let hint = row().w_full().center().child(el().padding(10.0).radius(16.0).fill(chip_bg()).child(chip));
     let stab = (r.stable_secs / 0.25).clamp(0.0, 1.0) as f32;
     let sharp_color = if r.sharp_rel < 0.8 { red() } else { green() };
     let bar = row()
@@ -1093,60 +1095,27 @@ fn running_view(s: &App) -> El {
     let mut panel = col().w(PANEL_W).h_full().gap(12.0).child(mosaic_box);
 
     if let Some(r) = &s.report {
-        // Capture steps
-        let active = match r.state {
-            CaptureState::Tracking => Some(0),
-            CaptureState::Stabilizing => Some(1),
-            CaptureState::Capture => Some(2),
-            CaptureState::Move => Some(3),
-            CaptureState::Lost => None,
+        // What to do next, in words
+        let (title, detail) = next_step(s, r);
+        let progress = if r.finished {
+            let rows = r.rows_done.max(1);
+            format!("{rows} row{} · {} tiles", if rows == 1 { "" } else { "s" }, r.tiles)
+        } else {
+            format!("Row {} · {} tiles", r.rows_done + 1, r.tiles)
         };
-        let color = if s.paused { dim() } else { state_color(r.state) };
-        let mut steps = row().w_full().gap(4.0).center();
-        for i in 0..4usize {
-            let on = active == Some(i);
-            let done = active.is_some_and(|a| i < a);
-            let fill = if on { color } else if done { green().alpha(0.3) } else { hex("#24252b") };
-            let fg = if on { Color::BLACK } else if done { green() } else { dim() };
-            steps = steps.child(
-                el().w(22.0).h(22.0).radius(11.0).fill(fill).center().child(
-                    text(if done { "✓".to_string() } else { (i + 1).to_string() }).font(type_::BODY).color(fg),
-                ),
-            );
-            if i < 3 {
-                steps = steps.child(el().grow(1.0).h(3.0).radius(2.0).fill(hex("#2a2b31")));
-            }
-        }
-        let names = row()
-            .w_full()
-            .child(text("Track".to_string()).font(type_::BODY).color(dim()))
-            .child(spacer())
-            .child(text("Settle".to_string()).font(type_::BODY).color(dim()))
-            .child(spacer())
-            .child(text("Capture".to_string()).font(type_::BODY).color(dim()))
-            .child(spacer())
-            .child(text("Move".to_string()).font(type_::BODY).color(dim()));
-        panel = panel.child(steps).child(names).child(text(hint_text(s, r)).font(type_::BODY).color(color));
+        panel = panel.child(
+            col()
+                .w_full()
+                .gap(6.0)
+                .padding(12.0)
+                .radius(10.0)
+                .fill(card())
+                .child(text(progress).font(type_::BODY).color(dim()))
+                .child(text(title).font(type_::TITLE).color(step_color(s, r)).w_full().wrap())
+                .child(text(detail).font(type_::BODY).color(soft()).w_full().wrap()),
+        );
 
-        // Metric tiles
-        let motion = r.motion.map_or("—".to_string(), |(dx, dy)| format!("{:.1} px", dx.hypot(dy)));
-        panel = panel
-            .child(
-                row()
-                    .w_full()
-                    .gap(8.0)
-                    .child(tile("Motion", motion))
-                    .child(tile("Sharpness", format!("{:.0} %", r.sharp_rel * 100.0))),
-            )
-            .child(
-                row()
-                    .w_full()
-                    .gap(8.0)
-                    .child(tile("Stability", format!("{:.0} ms", r.stable_secs * 1000.0)))
-                    .child(tile("Tiles", r.tiles.to_string())),
-            );
-
-        // Collapsible details
+        // Collapsible details: measurements and rarely needed settings
         let arrow = if s.details_open { "▾ Details" } else { "▸ Details" };
         let mut details = col().w_full().gap(6.0).child(
             el().key("details-toggle".to_string())
@@ -1157,11 +1126,21 @@ fn running_view(s: &App) -> El {
                 .child(text(arrow.to_string()).font(type_::BODY).color(dim())),
         );
         if s.details_open {
+            let motion = r.motion.map_or("—".to_string(), |(dx, dy)| format!("{:.1} px", dx.hypot(dy)));
             details = details
-                .child(kv("Row", format!("{}", r.rows_done + 1)))
-                .child(kv("Position", format!("{:.0}, {:.0} px", r.pos.0, r.pos.1)))
+                .child(choice(
+                    "auto".into(),
+                    format!("Automatic row ends: {} (A)", if s.auto_detect { "on" } else { "off" }),
+                    s.auto_detect,
+                    toggle_auto,
+                ))
+                .child(button("reverse".into(), "Flip row direction (R)".into(), reverse))
+                .child(kv("Motion", motion))
+                .child(kv("Sharpness", format!("{:.0} %", r.sharp_rel * 100.0)))
+                .child(kv("Stability", format!("{:.0} ms", r.stable_secs * 1000.0)))
                 .child(kv("Offset from last tile", format!("{:.0} %", r.offset_frac * 100.0)))
-                .child(kv("Raw sharpness", format!("{:.0}", r.sharp)))
+                .child(kv("Table seen ahead", format!("{:.0} %", r.edge_ahead * 100.0)))
+                .child(kv("Position", format!("{:.0}, {:.0} px", r.pos.0, r.pos.1)))
                 .child(kv("Analysis", format!("{:.1} ms", r.analysis_ms)))
                 .child(kv("Display", format!("{:.0} fps", s.fps)));
         }
@@ -1170,31 +1149,23 @@ fn running_view(s: &App) -> El {
         panel = panel.child(text("Opening source…".to_string()).font(type_::BODY).color(dim()));
     }
 
-    let finished = s.report.as_ref().is_some_and(|r| r.finished);
-    let stop_btn = if finished {
-        primary("resume", "Resume (F)", resume)
-    } else {
-        button("finish".into(), "Finish (F)".into(), finish)
-    };
-    let guidance = col()
-        .w_full()
-        .gap(8.0)
-        .child(text("Guidance".to_string()).font(type_::BODY).color(dim()))
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .child(button("end-row".into(), "End row (E)".into(), end_row))
-                .child(button("reverse".into(), "Reverse (R)".into(), reverse))
-                .child(stop_btn),
-        )
-        .child(choice(
-            "auto".into(),
-            format!("Auto-detect edges: {} (A)", if s.auto_detect { "on" } else { "off" }),
-            s.auto_detect,
-            toggle_auto,
-        ));
-    panel = panel.child(spacer()).child(export_panel(s)).child(guidance).child(
+    // One contextual action: the manual fallback for what the automatic edge handling does.
+    let mut guidance = col().w_full().gap(8.0);
+    if let Some(r) = &s.report {
+        if r.auto_step.is_some() {
+            guidance = guidance.child(button("not-edge".into(), "Not the edge — keep going (Esc)".into(), not_edge));
+        }
+        guidance = guidance.child(if r.finished {
+            button("resume".into(), "Continue mapping (F)".into(), resume)
+        } else if r.phase == Phase::Down {
+            button("finish".into(), "No more rows — finish map (F)".into(), finish)
+        } else if r.phase == Phase::Row && r.tiles > 0 {
+            button("end-row".into(), "Row ends here (E)".into(), end_row)
+        } else {
+            el()
+        });
+    }
+    panel = panel.child(spacer()).child(guidance).child(export_panel(s)).child(
         col()
             .w_full()
             .gap(8.0)

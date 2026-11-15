@@ -35,10 +35,8 @@ pub enum Control {
     Finish,
     /// Manual: flip the row direction.
     Reverse,
-    /// Accept the pending automatic suggestion.
-    Confirm,
-    /// Reject the pending automatic suggestion.
-    Dismiss,
+    /// The last automatic edge step was wrong: revert it and ignore that appearance.
+    NotEdge,
     /// Resume mapping after a finish.
     Resume,
     /// Turn automatic edge detection on or off.
@@ -170,8 +168,7 @@ impl Pipeline {
                                 Control::EndRow => an.end_row(),
                                 Control::Finish => an.finish(),
                                 Control::Reverse => an.reverse(),
-                                Control::Confirm => an.confirm(),
-                                Control::Dismiss => an.dismiss(),
+                                Control::NotEdge => an.not_an_edge(),
                                 Control::Resume => an.resume(),
                                 Control::AutoDetect(on) => an.auto_detect = on,
                                 Control::Stop => return,
@@ -249,8 +246,10 @@ fn empty_report(frame: &RgbImage, tiles: usize) -> Report {
         peak: 0.0,
         analysis_ms: 0.0,
         heading: Some((1.0, 0.0)),
+        row_dir: 1.0,
         phase: crate::guidance::Phase::Row,
-        suggestion: None,
+        edge_ahead: 0.0,
+        auto_step: None,
         rows_done: 0,
         finished: false,
         auto_detect: true,

@@ -170,6 +170,18 @@ pub fn synthetic_board(w: u32, h: u32) -> RgbImage {
     img
 }
 
+/// Wooden table: warm, low-contrast grain running roughly along x (like the real captures, where
+/// the table is anything but flat). Deterministic.
+pub fn wood_table(w: u32, h: u32) -> RgbImage {
+    RgbImage::from_fn(w, h, |x, y| {
+        let (xf, yf) = (x as f32, y as f32);
+        let grain = (yf * 0.11 + 4.0 * (xf * 0.0031 + yf * 0.004).sin() + 1.5 * (xf * 0.017).sin()).sin();
+        let fine = (((x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) >> 7) % 5) as f32 - 2.0;
+        let v = 9.0 * grain + fine;
+        Rgb([(96.0 + v) as u8, (80.0 + 0.9 * v) as u8, (66.0 + 0.8 * v) as u8])
+    })
+}
+
 /// Simulates a view moving over a large image: pauses at waypoints
 /// (like a hand stopping for the capture), constant-speed movement in between.
 pub struct ViewportSource {
@@ -230,10 +242,7 @@ pub fn demo_scene() -> (RgbImage, Vec<(f64, f64)>, Vec<u32>) {
     const VIEW: (f64, f64) = (1280.0, 720.0);
     let (bw, bh) = (2700u32, 1700u32);
     let (mx, my) = (560u32, 320u32); // table margin around the board
-    let mut canvas = RgbImage::from_fn(bw + 2 * mx, bh + 2 * my, |x, y| {
-        let n = ((x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) % 3) as i32 - 1;
-        Rgb([(58 + n) as u8, (60 + n) as u8, (64 + n) as u8]) // dark, flat table
-    });
+    let mut canvas = wood_table(bw + 2 * mx, bh + 2 * my);
     image::imageops::replace(&mut canvas, &synthetic_board(bw, bh), mx as i64, my as i64);
 
     let (mx, my, bw, bh) = (mx as f64, my as f64, bw as f64, bh as f64);

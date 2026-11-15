@@ -44,6 +44,9 @@ boards, microscope slides, documents and any other flat, textured surface.
 - The whole mosaic, or cropped to the largest fully covered rectangle
 - Every session (tiles and their positions) is saved, and can be exported again later
 
+<p align="center"><a href="docs/pcb.png"><img src="docs/pcb.jpg" alt="A whole Ettus Research B205mini-i radio board, stitched by Mosaïx from tiles taken by hand under a USB microscope"></a></p>
+<p align="center"><sub>An Ettus Research B205mini-i board, moved by hand under a USB microscope and stitched by Mosaïx (shown reduced; <a href="docs/pcb.png">full size, 6840 × 4470 px</a>).</sub></p>
+
 ## Shortcuts
 
 | | |

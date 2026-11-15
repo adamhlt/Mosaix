@@ -6,6 +6,9 @@
 //! [--crop] [--no-refine]`.
 //! UI testing without any source: `--fake stabilize|move|lost|closing|down|finished|dialog|update`
 //! shows a frozen state.
+// Release builds on Windows are a windowed app: no terminal window opens beside it. Debug builds
+// keep their console for the logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod update;
 
@@ -138,6 +141,8 @@ struct App {
     updater: update::Updater,
     /// "Up to date" or a failed manual check, shown in the update bar until dismissed.
     update_note: Option<String>,
+    /// A check asked for by hand is running: the bar says so instead of vanishing meanwhile.
+    update_checking: bool,
     initial: Option<SourceSpec>,
     fps_frames: u32,
     fps_t0: f64,
@@ -251,6 +256,7 @@ fn state() -> App {
         export_dialog: None,
         updater: update::Updater::new(),
         update_note: None,
+        update_checking: false,
         initial: spec,
         fps_frames: 0,
         fps_t0: 0.0,
@@ -429,6 +435,10 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     }
     if let Some(note) = s.updater.notice.take() {
         s.update_note = Some(note);
+    }
+    if s.update_checking && !matches!(s.updater.state, update::State::Checking) {
+        s.update_checking = false;
+        dirty = true;
     }
     let Some(p) = &s.pipeline else { return dirty };
     while let Ok(ev) = p.events.try_recv() {
@@ -1160,15 +1170,34 @@ fn version_link() -> El {
         .focusable(true)
         .w_full()
         .center()
-        .on_press(|s: &mut App| {
+        .on_press_tx(|s: &mut App, tx: &mut Tx| {
+            tx.instant();
             s.update_note = None;
+            s.update_checking = true;
             s.updater.check(true);
         })
         .child(text(format!("Mosaïx {} · check for updates", update::VERSION)).font(type_::BODY).color(dim()))
 }
 
-/// A bar across the top when a newer release exists (or after a manual check), with what can
-/// be done about it.
+/// A button of the update bar. Its changes land at once: the bar showing, hiding or changing
+/// its text resizes the whole screen under it, which would otherwise spring and fade.
+fn bar_button(key: &str, label: &str, primary: bool, on_press: impl Fn(&mut App) + 'static) -> El {
+    el().key(key.to_string())
+        .role("button")
+        .label(label.to_string())
+        .focusable(true)
+        .radius(8.0)
+        .padding(8.0)
+        .fill(if primary { tok::accent(0, true) } else { hex("#24252b") })
+        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            tx.instant();
+            on_press(s);
+        })
+        .child(text(label.to_string()).font(type_::BODY).color(Color::WHITE))
+}
+
+/// A bar across the top when a newer release exists (or during and after a check asked for by
+/// hand), with what can be done about it.
 fn update_banner(s: &App) -> Option<El> {
     use update::State;
     let open_page = |s: &mut App| {
@@ -1176,25 +1205,26 @@ fn update_banner(s: &App) -> Option<El> {
             update::open_url(&url);
         }
     };
-    let close = |key: &str| {
-        button(key.to_string(), "Dismiss".into(), |s: &mut App| {
+    let close = || {
+        bar_button("update-close", "Dismiss", false, |s: &mut App| {
             s.updater.dismiss();
             s.update_note = None;
         })
     };
     let (message, buttons): (String, Vec<El>) = match (&s.update_note, &s.updater.state) {
-        (Some(note), State::Idle | State::Checking) => (note.clone(), vec![close("update-close")]),
+        (_, State::Checking) if s.update_checking => ("Checking for updates…".into(), Vec::new()),
+        (Some(note), State::Idle | State::Checking) => (note.clone(), vec![close()]),
         (_, State::Available(o)) if o.can_install() => (
             format!("Mosaïx {} is available (you have {}).", o.release.version, update::VERSION),
             vec![
-                primary("update-install", "Update now", |s: &mut App| s.updater.install()),
-                button("update-page".into(), "Release page".into(), open_page),
-                close("update-close"),
+                bar_button("update-install", "Update now", true, |s: &mut App| s.updater.install()),
+                bar_button("update-page", "Release page", false, open_page),
+                close(),
             ],
         ),
         (_, State::Available(o)) => (
             format!("Mosaïx {} is available (you have {}). Download it from its release page.", o.release.version, update::VERSION),
-            vec![primary("update-page", "Open release page", open_page), close("update-close")],
+            vec![bar_button("update-page", "Open release page", true, open_page), close()],
         ),
         (_, State::Downloading { offer, done, total }) => {
             let pct = if *total > 0 { format!(" {} %", (done * 100 / total).min(100)) } else { String::new() };
@@ -1203,7 +1233,7 @@ fn update_banner(s: &App) -> Option<El> {
         (_, State::Installing(offer)) => (format!("Installing Mosaïx {}… the app restarts by itself.", offer.release.version), Vec::new()),
         (_, State::Failed { offer, message }) => (
             format!("Couldn't update to Mosaïx {}: {message}", offer.release.version),
-            vec![primary("update-page", "Open release page", open_page), close("update-close")],
+            vec![bar_button("update-page", "Open release page", true, open_page), close()],
         ),
         (None, State::Idle | State::Checking) => return None,
     };
@@ -1226,16 +1256,20 @@ fn view(s: &App, _: &mut Cx<App>) -> El {
         Screen::Menu => menu_view(s),
         Screen::Running => running_view(s),
     };
-    let main = match update_banner(s) {
-        Some(bar) => {
-            col().w_full().h_full().child(el().w_full().padding(12.0).pb(0.0).child(bar)).child(el().w_full().grow(1.0).child(main))
-        }
-        None => main,
-    };
-    match &s.export_dialog {
-        Some(dir) => el().w_full().h_full().child(main).child(export_dialog_view(s, dir)),
-        None => main,
+    // The screen keeps the same place in the tree whether the update bar or the export window
+    // shows: moving it to another parent would remount it, and its live view would fade back in.
+    // The page carries the app's background, so the margin around the update bar isn't the
+    // window's black.
+    let mut page = col().key("page".to_string()).w_full().h_full().fill(tok::theme(true).bg);
+    if let Some(bar) = update_banner(s) {
+        page = page.child(el().key("update-slot".to_string()).w_full().padding(12.0).pb(0.0).child(bar));
     }
+    page = page.child(el().key("screen".to_string()).w_full().grow(1.0).min_h(0.0).child(main));
+    let mut root = el().key("root".to_string()).w_full().h_full().child(page);
+    if let Some(dir) = &s.export_dialog {
+        root = root.child(export_dialog_view(s, dir));
+    }
+    root
 }
 /// `--export <session_dir> <out> [--scale N] [--crop] [--no-refine]`: no window.
 fn cli_export(args: &[String]) -> Option<i32> {
@@ -1376,8 +1410,28 @@ fn cli_grab(args: &[String]) -> Option<i32> {
     Some(0)
 }
 
+/// A windowed app has no console: the command-line modes write to the terminal they were
+/// started from instead (nothing happens when there is none, e.g. a double-click).
+fn attach_parent_console() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(process_id: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        // SAFETY: plain Win32 call with a constant argument; failure only means no console.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| matches!(a.as_str(), "--export" | "--list-modes" | "--grab")) {
+        attach_parent_console();
+    }
     if let Some(code) = cli_list_modes(&args) {
         std::process::exit(code);
     }

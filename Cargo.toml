@@ -3,7 +3,7 @@ name = "mosaix"
 version = "0.1.0"
 edition = "2021"
 description = "Cartographie haute résolution d'objets plats au microscope (capture + assemblage en direct)"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "mosaix"
@@ -44,3 +44,6 @@ wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f19045
 winit = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
 parley_engine = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
 accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+
+[build-dependencies]
+winresource = "0.1"

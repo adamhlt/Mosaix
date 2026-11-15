@@ -1,10 +1,10 @@
 //! Image sources: `CameraSource` abstraction + the nokhwa camera backend, plus a synthetic
 //! test bench (a simulated hand scanning a generated board) used by the tests and `--fake`.
 
-#[cfg(feature = "camera")]
-use anyhow::Context;
 #[cfg(not(feature = "camera"))]
 use anyhow::bail;
+#[cfg(feature = "camera")]
+use anyhow::Context;
 use anyhow::Result;
 use image::{Rgb, RgbImage};
 use std::time::{Duration, Instant};
@@ -145,7 +145,11 @@ pub fn synthetic_board(w: u32, h: u32) -> RgbImage {
         let len = (20.0 + rnd() * 160.0) as i64;
         let th = 3 + (rnd() * 5.0) as i64;
         let c = [190 + (rnd() * 30.0) as u8, 150 + (rnd() * 30.0) as u8, 40];
-        if rnd() < 0.5 { fill(&mut img, x, y, len, th, c) } else { fill(&mut img, x, y, th, len, c) }
+        if rnd() < 0.5 {
+            fill(&mut img, x, y, len, th, c)
+        } else {
+            fill(&mut img, x, y, th, len, c)
+        }
     }
     // Pads
     for _ in 0..(w * h / 6_000) {
@@ -206,29 +210,11 @@ impl ViewportSource {
     }
 
     /// Explicit waypoints (top-left of the view, canvas pixels) with a pause at each.
-    pub fn with_path(
-        board: RgbImage,
-        view: (u32, u32),
-        path: Vec<(f64, f64)>,
-        pauses: Vec<u32>,
-        speed: f64,
-        fps: Option<f32>,
-    ) -> Self {
+    pub fn with_path(board: RgbImage, view: (u32, u32), path: Vec<(f64, f64)>, pauses: Vec<u32>, speed: f64, fps: Option<f32>) -> Self {
         assert_eq!(path.len(), pauses.len());
         let pos = path[0];
         let pause_left = pauses[0];
-        Self {
-            board,
-            view,
-            path,
-            pauses,
-            target: 1,
-            pos,
-            speed,
-            pause_left,
-            pacer: fps.map(Pacer::new),
-            label: "synthetic demo".into(),
-        }
+        Self { board, view, path, pauses, target: 1, pos, speed, pause_left, pacer: fps.map(Pacer::new), label: "synthetic demo".into() }
     }
 
     pub fn is_done(&self) -> bool {
@@ -324,19 +310,13 @@ impl CameraSource for ViewportSource {
 pub mod nokhwa_source {
     use super::*;
     use nokhwa::pixel_format::RgbFormat;
-    use nokhwa::utils::{
-        CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
-    };
+    use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution};
     use nokhwa::Camera;
 
     /// Lists the detected cameras: `(index, name)`.
     pub fn list_cameras() -> Result<Vec<(u32, String)>> {
         let infos = nokhwa::query(nokhwa::utils::ApiBackend::Auto)?;
-        Ok(infos
-            .into_iter()
-            .enumerate()
-            .map(|(i, c)| (i as u32, c.human_name()))
-            .collect())
+        Ok(infos.into_iter().enumerate().map(|(i, c)| (i as u32, c.human_name())).collect())
     }
 
     fn to_nokhwa(f: PixelFormat) -> FrameFormat {
@@ -407,13 +387,8 @@ pub mod nokhwa_source {
             };
             cam.open_stream()?;
             let f = cam.camera_format();
-            let label = format!(
-                "camera {index} ({}x{} {:?} @{}fps)",
-                f.resolution().width(),
-                f.resolution().height(),
-                f.format(),
-                f.frame_rate()
-            );
+            let label =
+                format!("camera {index} ({}x{} {:?} @{}fps)", f.resolution().width(), f.resolution().height(), f.format(), f.frame_rate());
             Ok(Self { cam, label })
         }
     }

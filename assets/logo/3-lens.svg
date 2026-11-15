@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Mosaïx">
+  <circle cx="128" cy="128" r="92" fill="none" stroke="currentColor" stroke-width="16"/>
+  <rect x="80" y="80" width="44" height="44" rx="10" fill="currentColor"/>
+  <rect x="132" y="80" width="44" height="44" rx="10" fill="currentColor"/>
+  <rect x="80" y="132" width="44" height="44" rx="10" fill="currentColor"/>
+  <rect x="137" y="137" width="34" height="34" rx="8" fill="none" stroke="currentColor" stroke-width="10"/>
+</svg>

@@ -168,10 +168,13 @@ pub fn solve_poses(init: &[Pose], matches: &[PointMatch], size: f64) -> PoseFit 
         if round == 3 {
             break;
         }
-        let mut res: Vec<f64> = matches.iter().map(|m| {
-            let (dx, dy) = mismatch(&poses, m);
-            dx.hypot(dy)
-        }).collect();
+        let mut res: Vec<f64> = matches
+            .iter()
+            .map(|m| {
+                let (dx, dy) = mismatch(&poses, m);
+                dx.hypot(dy)
+            })
+            .collect();
         let mut sorted = res.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let cut = (2.0 * sorted[sorted.len() / 2]).max(1.0);

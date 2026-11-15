@@ -36,14 +36,7 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Self {
-            stable_px: 1.5,
-            stable_secs: 0.25,
-            trigger_frac: 0.65,
-            min_sharp_ratio: 0.8,
-            sharp_window_secs: 1.5,
-            lost_secs: 0.4,
-        }
+        Self { stable_px: 1.5, stable_secs: 0.25, trigger_frac: 0.65, min_sharp_ratio: 0.8, sharp_window_secs: 1.5, lost_secs: 0.4 }
     }
 }
 

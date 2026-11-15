@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Mosaïx
+Comment=Map a flat object under a microscope, tile by tile, into one sharp image
+Exec=mosaix
+Icon=mosaix
+Terminal=false
+Categories=Graphics;Science;

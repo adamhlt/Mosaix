@@ -174,11 +174,7 @@ impl Pipeline {
                             let mut report = last.clone().unwrap_or_else(|| empty_report(&frame, an.tile_count()));
                             report.captured = false;
                             report.tiles = an.tile_count();
-                            send_latest(
-                                &ev_tx,
-                                &ev_rx,
-                                Event::Update(Box::new(UiUpdate { frame, report, preview: None })),
-                            );
+                            send_latest(&ev_tx, &ev_rx, Event::Update(Box::new(UiUpdate { frame, report, preview: None })));
                             wake();
                             continue;
                         }
@@ -191,11 +187,7 @@ impl Pipeline {
                                 } else {
                                     None
                                 };
-                                send_latest(
-                                    &ev_tx,
-                                    &ev_rx,
-                                    Event::Update(Box::new(UiUpdate { frame, report, preview })),
-                                );
+                                send_latest(&ev_tx, &ev_rx, Event::Update(Box::new(UiUpdate { frame, report, preview })));
                                 wake();
                             }
                             Err(e) => tracing::error!("analysis: {e:#}"),

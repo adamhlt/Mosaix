@@ -30,10 +30,7 @@ pub struct Session {
 impl Session {
     /// Creates `root/session-<timestamp>/` with its `tiles/` subfolder.
     pub fn create(root: &Path) -> Result<Self> {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let dir = root.join(format!("session-{stamp}"));
         std::fs::create_dir_all(dir.join("tiles")).with_context(|| format!("creating {}", dir.display()))?;
         let s = Self { dir, meta: SessionMeta { version: 1, tiles: vec![] }, next_id: 1 };

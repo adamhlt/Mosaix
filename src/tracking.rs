@@ -42,9 +42,7 @@ pub struct PhaseCorrelator {
 }
 
 fn hann(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * (i as f32 + 0.5) / n as f32).cos())
-        .collect()
+    (0..n).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * (i as f32 + 0.5) / n as f32).cos()).collect()
 }
 
 /// Tukey (tapered-cosine) window: flat in the middle, cosine taper over a fraction `alpha` of the
@@ -104,7 +102,11 @@ impl PhaseCorrelator {
         let (w, h) = (self.w, self.h);
         let (n_main, n_other) = if horizontal { (w, h) } else { (h, w) };
         let signed = |k: usize, n: usize| -> f64 {
-            if k > n / 2 { k as f64 - n as f64 } else { k as f64 }
+            if k > n / 2 {
+                k as f64 - n as f64
+            } else {
+                k as f64
+            }
         };
         // Projection onto the other axis, evaluated at its integer position q.
         let mut prof = vec![Complex::<f64>::new(0.0, 0.0); n_main];
@@ -150,14 +152,7 @@ impl PhaseCorrelator {
     }
 
     /// In-place 2D FFT: rows, transpose, columns, transpose.
-    fn fft2(
-        w: usize,
-        h: usize,
-        row: &Arc<dyn Fft<f32>>,
-        col: &Arc<dyn Fft<f32>>,
-        data: &mut [Complex<f32>],
-        tmp: &mut [Complex<f32>],
-    ) {
+    fn fft2(w: usize, h: usize, row: &Arc<dyn Fft<f32>>, col: &Arc<dyn Fft<f32>>, data: &mut [Complex<f32>], tmp: &mut [Complex<f32>]) {
         for r in data.chunks_exact_mut(w) {
             row.process(r);
         }
@@ -217,12 +212,12 @@ impl PhaseCorrelator {
                 f * f
             })
             .collect();
-        for y in 0..h {
-            for x in 0..w {
+        for (y, fy) in fy2.iter().enumerate() {
+            for (x, fx) in fx2.iter().enumerate() {
                 let i = y * w + x;
                 let c = self.buf_a[i].conj() * self.buf_b[i];
                 let n = c.norm();
-                let g = (-(fx2[x] + fy2[y]) / (2.0 * SIGMA * SIGMA)).exp();
+                let g = (-(fx + fy) / (2.0 * SIGMA * SIGMA)).exp();
                 self.buf_a[i] = if n > 1e-9 { c * (g / n) } else { Complex::new(0.0, 0.0) };
             }
         }
@@ -308,7 +303,7 @@ pub fn gray_small(img: &RgbImage, k: u32) -> GrayImage {
     let stride = img.width() as usize * 3;
     let mut out = GrayImage::new(w, h);
     let dst = out.as_mut();
-    let area = (k * k) as u32;
+    let area = k * k;
     for y in 0..h as usize {
         for x in 0..w as usize {
             let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);

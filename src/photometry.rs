@@ -261,10 +261,8 @@ mod tests {
             assert!(d.abs() < 0.02, "at {u},{v}: off by {d:.3}");
         }
         // without exposure changes, the prior has nothing to trade: the light comes out exactly
-        let flat: Vec<FieldSample> = samples
-            .iter()
-            .map(|s| FieldSample { y: s.y - (expo[s.i as usize] - expo[s.j as usize]) as f32, ..*s })
-            .collect();
+        let flat: Vec<FieldSample> =
+            samples.iter().map(|s| FieldSample { y: s.y - (expo[s.i as usize] - expo[s.j as usize]) as f32, ..*s }).collect();
         let f = fit(origins.len(), &flat, 0.05, 1e-4);
         let c = f.frame(0.0, 0.0) - light(0.0, 0.0);
         for &(u, v) in &[(-0.9, -0.8), (0.9, 0.0), (0.5, 0.7)] {

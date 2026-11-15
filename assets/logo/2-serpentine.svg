@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Mosaïx">
+  <path d="M64 64 H176 A32 32 0 0 1 176 128 H80 A32 32 0 0 0 80 192 H178" fill="none" stroke="currentColor" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="56" cy="64" r="20" fill="currentColor"/>
+  <path d="M176 164 L212 192 L176 220 Z" fill="currentColor" stroke="currentColor" stroke-width="8" stroke-linejoin="round"/>
+</svg>

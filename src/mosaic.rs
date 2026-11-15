@@ -45,11 +45,7 @@ impl Mosaic {
     }
 
     pub fn add(&mut self, full: &RgbImage, pos: (f64, f64)) {
-        self.tiles.push(MosaicTile {
-            pos,
-            size: (full.width(), full.height()),
-            thumb: rgb_downscale(full, THUMB_K),
-        });
+        self.tiles.push(MosaicTile { pos, size: (full.width(), full.height()), thumb: rgb_downscale(full, THUMB_K) });
     }
 
     pub fn add_thumb(&mut self, thumb: RgbImage, pos: (f64, f64), size: (u32, u32)) {

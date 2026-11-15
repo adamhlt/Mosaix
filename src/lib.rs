@@ -9,6 +9,6 @@ pub mod focus;
 pub mod guidance;
 pub mod mosaic;
 pub mod photometry;
+pub mod pipeline;
 pub mod session;
 pub mod tracking;
-pub mod pipeline;

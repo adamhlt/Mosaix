@@ -14,10 +14,7 @@ pub fn sharpness(img: &GrayImage) -> f32 {
     for y in 1..h - 1 {
         let row = y * w;
         for x in 1..w - 1 {
-            let l = p[row + x - 1] as i32 + p[row + x + 1] as i32
-                + p[row - w + x] as i32
-                + p[row + w + x] as i32
-                - 4 * p[row + x] as i32;
+            let l = p[row + x - 1] as i32 + p[row + x + 1] as i32 + p[row - w + x] as i32 + p[row + w + x] as i32 - 4 * p[row + x] as i32;
             let l = l as f64;
             sum += l;
             sum2 += l * l;
@@ -34,9 +31,7 @@ mod tests {
     use image::{imageops, GrayImage, Luma};
 
     fn checker(n: u32, cell: u32) -> GrayImage {
-        GrayImage::from_fn(n, n, |x, y| {
-            if (x / cell + y / cell) % 2 == 0 { Luma([30]) } else { Luma([220]) }
-        })
+        GrayImage::from_fn(n, n, |x, y| if (x / cell + y / cell).is_multiple_of(2) { Luma([30]) } else { Luma([220]) })
     }
 
     #[test]

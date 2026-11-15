@@ -100,12 +100,7 @@ pub struct Progress {
 
 impl Progress {
     pub fn new(wake: Option<Arc<dyn Fn() + Send + Sync>>) -> Arc<Self> {
-        Arc::new(Self {
-            stage: Mutex::new(String::new()),
-            bits: AtomicU32::new(0f32.to_bits()),
-            cancelled: AtomicBool::new(false),
-            wake,
-        })
+        Arc::new(Self { stage: Mutex::new(String::new()), bits: AtomicU32::new(0f32.to_bits()), cancelled: AtomicBool::new(false), wake })
     }
     pub fn set(&self, stage: &str, frac: f32) {
         if let Ok(mut s) = self.stage.lock() {
@@ -168,22 +163,13 @@ struct TileSet {
 
 impl TileSet {
     fn new(dir: &Path, meta: Vec<TileMeta>, scale: f32, budget: usize) -> Self {
-        Self {
-            dir: dir.to_path_buf(),
-            meta,
-            scale,
-            budget,
-            cache: Mutex::new(Cache { map: HashMap::new(), bytes: 0, tick: 0 }),
-        }
+        Self { dir: dir.to_path_buf(), meta, scale, budget, cache: Mutex::new(Cache { map: HashMap::new(), bytes: 0, tick: 0 }) }
     }
 
     /// Size of tile `i` at this set's scale.
     fn size(&self, i: usize) -> (i64, i64) {
         let m = &self.meta[i];
-        (
-            ((m.width as f32 * self.scale).round() as i64).max(1),
-            ((m.height as f32 * self.scale).round() as i64).max(1),
-        )
+        (((m.width as f32 * self.scale).round() as i64).max(1), ((m.height as f32 * self.scale).round() as i64).max(1))
     }
 
     fn load(&self, i: usize) -> Result<Arc<RgbImage>> {
@@ -534,7 +520,8 @@ fn for_overlap_cells(
         }
         let (w, h) = (a.w, a.h);
         let g = GRID as f64;
-        let (hi, hj) = ((meta[i].width as f64 / 2.0, meta[i].height as f64 / 2.0), (meta[j].width as f64 / 2.0, meta[j].height as f64 / 2.0));
+        let (hi, hj) =
+            ((meta[i].width as f64 / 2.0, meta[i].height as f64 / 2.0), (meta[j].width as f64 / 2.0, meta[j].height as f64 / 2.0));
         let uv = |x: f64, y: f64| (2.0 * (x + 0.5) / w as f64 - 1.0, 2.0 * (y + 0.5) / h as f64 - 1.0);
         let mut cells = Vec::new();
         for y in 0..h {
@@ -569,7 +556,8 @@ fn fit_colour(grids: &[Option<Grids>], meta: &[TileMeta], poses: &[Pose], pairs:
         for c in 0..3 {
             // the log of a dark value is mostly noise: trust a sample in proportion to its signal
             let weight = (va[c].min(vb[c]) / 64.0).min(1.0);
-            samples[c].push(FieldSample { weight: weight * weight, ..FieldSample::new(i, j, pi, pj, (va[c] as f64).ln() - (vb[c] as f64).ln()) });
+            samples[c]
+                .push(FieldSample { weight: weight * weight, ..FieldSample::new(i, j, pi, pj, (va[c] as f64).ln() - (vb[c] as f64).ln()) });
         }
     });
     samples.map(|s| photometry::fit(n, &s, COLOUR_TILE_PRIOR, FRAME_PRIOR))
@@ -754,7 +742,7 @@ fn coarse_probe(a: &Small, b: &Small, pc: &mut PhaseCorrelator, recorded: (f64, 
     };
     let better = |best: &mut Option<Probe>, c: Option<Probe>| {
         if let Some(c) = c {
-            if best.map_or(true, |b| c.score > b.score) {
+            if best.is_none_or(|b| c.score > b.score) {
                 *best = Some(c);
             }
         }
@@ -774,7 +762,10 @@ fn coarse_probe(a: &Small, b: &Small, pc: &mut PhaseCorrelator, recorded: (f64, 
     let near = pc.correlate_near(&a.px, &b.px, d0x, d0y, radius);
     let pick = |d: f64, d0: f64, n: usize| {
         // the reported peak is wrapped; keep the representative closest to the expectation
-        [d, alt(d, n)].into_iter().min_by(|p, q| (p - d0).abs().partial_cmp(&(q - d0).abs()).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(d)
+        [d, alt(d, n)]
+            .into_iter()
+            .min_by(|p, q| (p - d0).abs().partial_cmp(&(q - d0).abs()).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(d)
     };
     let hinted = eval(pick(near.dx, d0x, a.w), pick(near.dy, d0y, a.h), true);
 
@@ -806,11 +797,13 @@ fn coarse_pair(probe: &Probe, k: u32, recorded: (f64, f64), tile_min: f64) -> Op
 /// count), over every pair overlapping by at least 10 % of a tile.
 fn overlap_error(smalls: &[Option<Small>], meta: &[TileMeta], poses: &[Pose]) -> Option<f64> {
     let (mut sum, mut weight) = (0.0f64, 0.0f64);
-    let positions: Vec<(f64, f64)> = poses.iter().zip(meta).map(|(p, m)| (p.cx - m.width as f64 / 2.0, p.cy - m.height as f64 / 2.0)).collect();
+    let positions: Vec<(f64, f64)> =
+        poses.iter().zip(meta).map(|(p, m)| (p.cx - m.width as f64 / 2.0, p.cy - m.height as f64 / 2.0)).collect();
     for (i, j) in overlapping_pairs(meta, &positions) {
         let (Some(a), Some(b)) = (&smalls[i], &smalls[j]) else { continue };
         let k = a.k as f64;
-        let (hi, hj) = ((meta[i].width as f64 / 2.0, meta[i].height as f64 / 2.0), (meta[j].width as f64 / 2.0, meta[j].height as f64 / 2.0));
+        let (hi, hj) =
+            ((meta[i].width as f64 / 2.0, meta[i].height as f64 / 2.0), (meta[j].width as f64 / 2.0, meta[j].height as f64 / 2.0));
         let mut vals: Vec<(f32, f32)> = Vec::new();
         for y in 0..b.h {
             for x in 0..b.w {
@@ -930,11 +923,8 @@ fn match_pair(a: &Small, b: &Small, (i, j): (usize, usize), meta: &[TileMeta], p
                 scores[(oy + r) as usize * side + (ox + r) as usize] = (cross / n - ma * mb) / (va * vb).sqrt();
             }
         }
-        let (bi, &best) = scores
-            .iter()
-            .enumerate()
-            .max_by(|u, v| u.1.partial_cmp(v.1).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or((0, &f64::MIN));
+        let (bi, &best) =
+            scores.iter().enumerate().max_by(|u, v| u.1.partial_cmp(v.1).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or((0, &f64::MIN));
         let (gx, gy) = ((bi % side) as i64, (bi / side) as i64);
         // on the border of the search window: the true peak may lie beyond
         if best < MATCH_MIN_NCC || gx == 0 || gy == 0 || gx == 2 * r || gy == 2 * r {
@@ -972,29 +962,20 @@ fn match_pair(a: &Small, b: &Small, (i, j): (usize, usize), meta: &[TileMeta], p
 
 /// Solves for positions, then drops the measurements that disagree with the solution
 /// (more than 3× the median residual, and at least `cut_min` px) and solves again.
-fn solve_robust(
-    start: &[(f64, f64)],
-    measures: Vec<PairMeasure>,
-    cut_min: f64,
-) -> (Vec<(f64, f64)>, Vec<PairMeasure>) {
+fn solve_robust(start: &[(f64, f64)], measures: Vec<PairMeasure>, cut_min: f64) -> (Vec<(f64, f64)>, Vec<PairMeasure>) {
     if measures.is_empty() {
         return (start.to_vec(), measures);
     }
     let total_w: f64 = measures.iter().map(|m| m.w).sum();
     let prior = 1e-3 * total_w / start.len() as f64;
     let pos = refine_positions(start, &measures, prior);
-    let residual = |pos: &[(f64, f64)], m: &PairMeasure| {
-        (pos[m.j].0 - pos[m.i].0 - m.t.0).hypot(pos[m.j].1 - pos[m.i].1 - m.t.1)
-    };
+    let residual = |pos: &[(f64, f64)], m: &PairMeasure| (pos[m.j].0 - pos[m.i].0 - m.t.0).hypot(pos[m.j].1 - pos[m.i].1 - m.t.1);
     let mut res: Vec<f64> = measures.iter().map(|m| residual(&pos, m)).collect();
     res.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let cut = (3.0 * res[res.len() / 2]).max(cut_min);
     let kept: Vec<PairMeasure> = measures.iter().filter(|m| residual(&pos, m) <= cut).copied().collect();
-    let (pos, kept) = if kept.len() < measures.len() && !kept.is_empty() {
-        (refine_positions(start, &kept, prior), kept)
-    } else {
-        (pos, measures)
-    };
+    let (pos, kept) =
+        if kept.len() < measures.len() && !kept.is_empty() { (refine_positions(start, &kept, prior), kept) } else { (pos, measures) };
     if std::env::var_os("MOSAIX_DEBUG").is_some() {
         let mut r: Vec<(f64, usize, usize)> = kept.iter().map(|m| (residual(&pos, m), m.i, m.j)).collect();
         r.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1086,7 +1067,7 @@ impl Plane {
     /// Blurs with the 5-tap binomial kernel and keeps every other pixel.
     fn down(&self) -> Plane {
         let (w, h) = (self.w, self.h);
-        let (nw, nh) = ((w + 1) / 2, (h + 1) / 2);
+        let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
         let mut tmp = Plane::new(nw, h);
         for y in 0..h {
             let row = &self.d[y * w..(y + 1) * w];
@@ -1203,7 +1184,8 @@ impl Placed {
         let mut ys: Vec<f64> = corners.iter().map(|c| c.1).collect();
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let inner = (xs[1].ceil() as i64, ys[1].ceil() as i64, (xs[2].floor() - xs[1].ceil()) as i64, (ys[2].floor() - ys[1].ceil()) as i64);
+        let inner =
+            (xs[1].ceil() as i64, ys[1].ceil() as i64, (xs[2].floor() - xs[1].ceil()) as i64, (ys[2].floor() - ys[1].ceil()) as i64);
         Self {
             x0: xs[0].floor() as i64,
             y0: ys[0].floor() as i64,
@@ -1377,10 +1359,9 @@ fn blend_block(
     }
     // Collapse the pyramid.
     let mut out: Vec<Plane> = Vec::new();
-    for c in 0..3 {
-        let mut acc = result[c][BANDS].clone();
-        for k in (0..BANDS).rev() {
-            let band = &result[c][k];
+    for bands in &result {
+        let mut acc = bands[BANDS].clone();
+        for band in bands[..BANDS].iter().rev() {
             let mut up = acc.up(band.w, band.h);
             for i in 0..up.d.len() {
                 up.d[i] += band.d[i];
@@ -1417,12 +1398,7 @@ fn save(img: &RgbaImage, path: &Path, format: Format, quality: u8) -> Result<()>
 }
 
 /// Exports the session in `session_dir` to `out`.
-pub fn export_session(
-    session_dir: &Path,
-    out: &Path,
-    opts: &ExportOptions,
-    progress: &Progress,
-) -> Result<ExportResult> {
+pub fn export_session(session_dir: &Path, out: &Path, opts: &ExportOptions, progress: &Progress) -> Result<ExportResult> {
     let session = Session::open(session_dir).context("opening the session")?;
     let meta = session.meta.tiles.clone();
     let n = meta.len();
@@ -1637,14 +1613,11 @@ pub fn export_session(
         let _ = std::fs::write(p, serde_json::to_string(&v).unwrap_or_default());
     }
     // top-left corners, for what only needs the layout roughly
-    let positions: Vec<(f64, f64)> = poses.iter().zip(&meta).map(|(p, m)| (p.cx - m.width as f64 / 2.0, p.cy - m.height as f64 / 2.0)).collect();
+    let positions: Vec<(f64, f64)> =
+        poses.iter().zip(&meta).map(|(p, m)| (p.cx - m.width as f64 / 2.0, p.cy - m.height as f64 / 2.0)).collect();
     let overlap_error = if kept_smalls.is_empty() || !opts.refine { None } else { overlap_error(&kept_smalls, &meta, &poses) };
     drop(kept_smalls);
-    let max_correction = positions
-        .iter()
-        .zip(&p0)
-        .map(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1))
-        .fold(0.0, f64::max);
+    let max_correction = positions.iter().zip(&p0).map(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1)).fold(0.0, f64::max);
 
     // ---- 3) colour and focus models of the frame, from the overlaps at their final positions
     progress.set("Matching brightness", 0.38);
@@ -1672,7 +1645,9 @@ pub fn export_session(
             }
         }
         if let Some(f) = &focus {
-            let row = |v: f64| (0..5).map(|k| format!("{:.2}", (f.frame(-1.0 + 0.5 * k as f64, v) - f.frame_mean()).exp())).collect::<Vec<_>>().join(" ");
+            let row = |v: f64| {
+                (0..5).map(|k| format!("{:.2}", (f.frame(-1.0 + 0.5 * k as f64, v) - f.frame_mean()).exp())).collect::<Vec<_>>().join(" ")
+            };
             eprintln!("focus: {} samples, sharpness top [{}] middle [{}] bottom [{}]", f.samples, row(-0.9), row(0.0), row(0.9));
             eprintln!("focus per tile: {:?}", f.tile.iter().map(|t| format!("{:.2}", t.exp())).collect::<Vec<_>>());
         }
@@ -1718,11 +1693,8 @@ pub fn export_session(
     }
     let scale = scale as f32;
     let blend_set = TileSet::new(session_dir, meta.clone(), scale, opts.cache_bytes);
-    let placed: Vec<Placed> = (0..n)
-        .map(|i| {
-            Placed::new(&poses[i], (meta[i].width, meta[i].height), blend_set.size(i), scale as f64, (min_x, min_y))
-        })
-        .collect();
+    let placed: Vec<Placed> =
+        (0..n).map(|i| Placed::new(&poses[i], (meta[i].width, meta[i].height), blend_set.size(i), scale as f64, (min_x, min_y))).collect();
     let (cw, ch) = (placed.iter().map(|p| p.x1).max().unwrap_or(1), placed.iter().map(|p| p.y1).max().unwrap_or(1));
     let (rx, ry, rw, rh) = if opts.crop {
         let rects: Vec<_> = placed.iter().map(|p| p.inner).collect();
@@ -1834,8 +1806,7 @@ pub fn export_session(
             std::fs::create_dir_all(dir)?;
         }
     }
-    save(&canvas, out, Format::from_path(out), opts.jpeg_quality)
-        .with_context(|| format!("writing {}", out.display()))?;
+    save(&canvas, out, Format::from_path(out), opts.jpeg_quality).with_context(|| format!("writing {}", out.display()))?;
     progress.set("Done", 1.0);
     Ok(ExportResult {
         path: out.to_path_buf(),
@@ -1873,10 +1844,8 @@ mod tests {
                 pairs.push((k, k + 4));
             }
         }
-        let measures: Vec<PairMeasure> = pairs
-            .iter()
-            .map(|&(i, j)| PairMeasure { i, j, t: (truth[j].0 - truth[i].0, truth[j].1 - truth[i].1), w: 1.0 })
-            .collect();
+        let measures: Vec<PairMeasure> =
+            pairs.iter().map(|&(i, j)| PairMeasure { i, j, t: (truth[j].0 - truth[i].0, truth[j].1 - truth[i].1), w: 1.0 }).collect();
         let r = refine_positions(&init, &measures, 1e-3);
         for k in 0..12 {
             let (ex, ey) = (r[k].0 - r[0].0 - (truth[k].0 - truth[0].0), r[k].1 - r[0].1 - (truth[k].1 - truth[0].1));
@@ -1903,8 +1872,8 @@ mod tests {
         // two rows of tiles, the second one shifted right: the clean rectangle is their common part
         let rects = vec![(0, 0, 400, 300), (350, 0, 400, 300), (100, 250, 400, 300), (450, 250, 400, 300)];
         let (x, y, w, h) = covered_rect(&rects, 850, 550);
-        assert!(x >= 98 && x <= 110 && y <= 8, "{x},{y}");
-        assert!(w >= 640 && w <= 652 && h >= 540, "{w}x{h}");
+        assert!((98..=110).contains(&x) && y <= 8, "{x},{y}");
+        assert!((640..=652).contains(&w) && h >= 540, "{w}x{h}");
     }
 
     /// Writes a session whose tiles come from a known board, with drifting position estimates and
@@ -1983,7 +1952,12 @@ mod tests {
         export_session(session.dir(), &out, &ExportOptions::default(), &Progress::new(None)).unwrap();
         let mosaic = image::open(&out).unwrap().to_rgb8();
         assert_eq!(mosaic.dimensions(), tile.dimensions());
-        let worst = mosaic.pixels().zip(tile.pixels()).map(|(a, b)| (0..3).map(|c| (a.0[c] as i32 - b.0[c] as i32).abs()).max().unwrap_or(0)).max().unwrap_or(0);
+        let worst = mosaic
+            .pixels()
+            .zip(tile.pixels())
+            .map(|(a, b)| (0..3).map(|c| (a.0[c] as i32 - b.0[c] as i32).abs()).max().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
         assert!(worst <= 2, "worst difference {worst}");
         let _ = std::fs::remove_dir_all(&root);
     }

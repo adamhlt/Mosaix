@@ -4,7 +4,6 @@ pub mod align;
 pub mod analysis;
 pub mod camera;
 pub mod capture;
-pub mod edge;
 pub mod export;
 pub mod focus;
 pub mod guidance;

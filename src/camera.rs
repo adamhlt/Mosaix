@@ -237,7 +237,7 @@ impl ViewportSource {
 }
 
 /// Board on a table + waypoints of the demo hand. Pauses are short at ordinary waypoints and
-/// long where the view overshoots an edge (time to detect, confirm and capture the last tile).
+/// long where the view overshoots an edge (time to end the row and capture its last tile).
 pub fn demo_scene() -> (RgbImage, Vec<(f64, f64)>, Vec<u32>) {
     const VIEW: (f64, f64) = (1280.0, 720.0);
     let (bw, bh) = (2700u32, 1700u32);

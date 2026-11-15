@@ -1,9 +1,8 @@
 //! Frame analysis: motion, position, sharpness, capture decision, guidance.
 
 use crate::capture::{CaptureMachine, Input, Params, State};
-use crate::edge::{Band, BlockMap, EdgeDetector, EdgeParams, Side};
 use crate::focus::sharpness;
-use crate::guidance::{AutoStep, Guide, Phase};
+use crate::guidance::{Guide, Phase};
 use crate::mosaic::Mosaic;
 use crate::session::Session;
 use crate::tracking::{gray_small, to_f32, PhaseCorrelator};
@@ -58,13 +57,8 @@ pub struct Report {
     /// +1 = the current row runs to the right, -1 = to the left.
     pub row_dir: f64,
     pub phase: Phase,
-    /// Depth (fraction of the field) of the table seen beyond the board edge ahead, 0 if none.
-    pub edge_ahead: f32,
-    /// Last automatic step (row ended / map finished), revertible with "not the edge".
-    pub auto_step: Option<AutoStep>,
     pub rows_done: usize,
     pub finished: bool,
-    pub auto_detect: bool,
 }
 
 pub struct Analyzer {
@@ -78,13 +72,6 @@ pub struct Analyzer {
     pub mosaic: Mosaic,
     pub session: Option<Session>,
     pub guide: Guide,
-    pub edge: EdgeDetector,
-    /// Automatic edge detection; the manual controls always work.
-    pub auto_detect: bool,
-    /// Table band seen ahead on the last frame.
-    ahead: Option<Band>,
-    /// Band that triggered the last automatic step.
-    fired: Option<Band>,
 }
 
 impl Analyzer {
@@ -100,10 +87,6 @@ impl Analyzer {
             mosaic: Mosaic::new(),
             session,
             guide: Guide::default(),
-            edge: EdgeDetector::new(EdgeParams::default()),
-            auto_detect: true,
-            ahead: None,
-            fired: None,
         }
     }
 
@@ -124,7 +107,7 @@ impl Analyzer {
         Ok(true)
     }
 
-    // ---- guidance controls (manual fallbacks of the automatic edge handling) ----
+    // ---- guidance controls (the user ends rows and the map) ----
 
     /// Is there new area since the last tile that a closing capture would cover?
     fn needs_closing(&self) -> bool {
@@ -151,17 +134,6 @@ impl Analyzer {
     /// Manual: resume after a finish.
     pub fn resume(&mut self) {
         self.guide.resume();
-        self.edge.rearm();
-    }
-
-    /// "Not the edge": reverts the last automatic step (or ignores the band seen ahead) and never
-    /// fires again on that appearance; the detector stays quiet until the next capture.
-    pub fn not_an_edge(&mut self) {
-        let band = if self.guide.revert_auto() { self.fired.take() } else { self.ahead };
-        if let Some(b) = band {
-            self.edge.reject(&b.look);
-        }
-        self.ahead = None;
     }
 
     pub fn process(&mut self, frame: &RgbImage, t: f64) -> Result<Report> {
@@ -255,44 +227,9 @@ impl Analyzer {
                 s.add_tile(&tile_frame, tile_pos)?;
             }
             self.mosaic.add(&tile_frame, tile_pos);
-            // What the board looks like (the middle of every tile) is what the table is not.
-            let tile_map = BlockMap::new(&tile_frame, &tile_gray, ANALYSIS_K, self.edge.params.block);
-            self.edge.observe_tile(&tile_map);
             self.tiles.push(TileRef { gray: tile_gray, pos: tile_pos });
             self.recent.clear();
             self.guide.tile_captured();
-            if self.tiles.len() == 1 && self.guide.rows_done == 0 && self.guide.phase == Phase::Row && self.auto_detect {
-                // Started at the right end of the first row: the rows run to the left.
-                let right = self.edge.band(&tile_map, Side::Right).is_some();
-                let left = self.edge.band(&tile_map, Side::Left).is_some();
-                if right && !left {
-                    self.guide.row_dir = -1.0;
-                }
-            }
-        }
-
-        // 5) automatic edge handling: table ahead → end of the row (or of the map)
-        let watch = self.auto_detect
-            && !capture
-            && !self.tiles.is_empty()
-            && self.guide.edge_meaning().is_some()
-            && d.state != State::Capture;
-        let status = match self.guide.heading() {
-            Some(hd) if watch => {
-                let map = BlockMap::new(frame, &gray, ANALYSIS_K, self.edge.params.block);
-                self.edge.update(Some(&map), Side::from_heading(hd), t, motion_px)
-            }
-            _ => self.edge.update(None, Side::Right, t, 0.0),
-        };
-        self.ahead = status.band;
-        if status.edge {
-            let nc = self.needs_closing();
-            if self.guide.edge_reached(nc).is_some() {
-                if let Some(b) = status.band {
-                    self.edge.accept(&b);
-                    self.fired = Some(b);
-                }
-            }
         }
 
         Ok(Report {
@@ -311,11 +248,8 @@ impl Analyzer {
             heading: self.guide.heading(),
             row_dir: self.guide.row_dir,
             phase: self.guide.phase,
-            edge_ahead: self.ahead.map_or(0.0, |b| b.depth),
-            auto_step: self.guide.auto_step(),
             rows_done: self.guide.rows_done,
             finished: self.guide.finished,
-            auto_detect: self.auto_detect,
         })
     }
 }
@@ -374,97 +308,24 @@ mod tests {
         assert_eq!(an.mosaic.len(), 1);
     }
 
-    /// The demo hand overshoots every board edge onto a wood-grain table: with no one pressing
-    /// anything, the analyzer must end each row, capture its last tile, step down, and finish
-    /// when the step down shows the table below.
-    #[test]
-    fn demo_run_is_fully_automatic() {
-        let (canvas, path, pauses) = demo_scene();
-        let mut src = ViewportSource::with_path(canvas, (1280, 720), path, pauses, 14.0, None);
-        let mut an = Analyzer::new(Params::default(), None);
-        let (mut i, mut edge_frames, mut autos, mut last) = (0u32, 0u32, Vec::new(), None::<Report>);
-        while let Some(f) = src.next_frame().unwrap() {
-            let r = an.process(&f, i as f64 / 30.0).unwrap();
-            if r.edge_ahead > 0.0 {
-                edge_frames += 1;
-            }
-            if r.auto_step.is_some() && last.as_ref().is_some_and(|l| l.auto_step != r.auto_step) {
-                autos.push((i, r.auto_step.unwrap(), r.rows_done));
-            }
-            if r.captured {
-                eprintln!("i={i} tile #{} at ({:.0},{:.0}) phase={:?} rows={}", r.tiles, r.pos.0, r.pos.1, r.phase, r.rows_done);
-            }
-            last = Some(r);
-            i += 1;
-        }
-        let r = last.unwrap();
-        eprintln!("{i} frames, {} tiles, {} rows, finished={}, edge frames={edge_frames}, autos={autos:?}", r.tiles, r.rows_done, r.finished);
-        assert!(r.finished, "the map was not finished");
-        assert_eq!(r.rows_done, 3);
-        assert!(r.tiles >= 12, "only {} tiles", r.tiles);
-        assert_eq!(autos.iter().filter(|a| a.1 == AutoStep::RowEnded).count(), 3, "{autos:?}");
-        assert_eq!(autos.last().map(|a| a.1), Some(AutoStep::MapFinished));
-    }
-
-    /// "Not the edge" right after an automatic row end puts the guide back on the row, and the
-    /// same table does not end the row again.
-    #[test]
-    fn not_an_edge_reverts_and_sticks() {
-        let (canvas, path, pauses) = demo_scene();
-        let mut src = ViewportSource::with_path(canvas, (1280, 720), path, pauses, 14.0, None);
-        let mut an = Analyzer::new(Params::default(), None);
-        let mut i = 0u32;
-        let mut reverted_at = None;
-        while let Some(f) = src.next_frame().unwrap() {
-            let r = an.process(&f, i as f64 / 30.0).unwrap();
-            i += 1;
-            if let Some(at) = reverted_at {
-                assert_ne!(r.auto_step, Some(AutoStep::RowEnded), "row ended again {} frames later", i - at);
-                if i - at > 200 {
-                    break;
-                }
-            } else if r.auto_step == Some(AutoStep::RowEnded) {
-                an.not_an_edge();
-                assert_eq!(an.guide.phase, Phase::Row);
-                assert_eq!(an.guide.rows_done, 0);
-                assert_eq!(an.guide.heading(), Some((1.0, 0.0)));
-                reverted_at = Some(i);
-            }
-        }
-        assert!(reverted_at.is_some(), "the row end was never detected");
-    }
-
-    /// Starting at the right end of the first row (table on the right): rows run to the left.
-    #[test]
-    fn first_tile_at_the_right_edge_flips_the_rows() {
-        let (canvas, _, _) = demo_scene();
-        let (mx, my, bw) = (560.0, 320.0, 2700.0);
-        let x = mx + bw - 0.7 * 1280.0; // 30 % of the view beyond the right edge
-        let path = vec![(x, my), (x - 500.0, my)];
-        let mut src = ViewportSource::with_path(canvas, (1280, 720), path, vec![20, 20], 14.0, None);
-        let mut an = Analyzer::new(Params::default(), None);
-        let mut i = 0;
-        while an.tile_count() < 1 {
-            let f = src.next_frame().unwrap().expect("stream ended too early");
-            an.process(&f, i as f64 / 30.0).unwrap();
-            i += 1;
-        }
-        assert_eq!(an.guide.heading(), Some((-1.0, 0.0)));
-    }
-
-    /// Detection off: nothing advances by itself; the manual fallbacks work.
+    /// Nothing advances by itself; the manual controls drive the guide.
     #[test]
     fn manual_controls_drive_the_guide() {
         let (canvas, path, pauses) = demo_scene();
         let mut src = ViewportSource::with_path(canvas, (1280, 720), path, pauses, 14.0, None);
         let mut an = Analyzer::new(Params::default(), None);
-        an.auto_detect = false; // fully manual: no suggestion may ever appear
         let mut i = 0u32;
-        let mut ended_row = false;
+        let (mut ended_row, mut finish_at) = (false, None);
         while let Some(f) = src.next_frame().unwrap() {
             let r = an.process(&f, i as f64 / 30.0).unwrap();
-            assert_eq!(r.edge_ahead, 0.0);
-            assert!(r.auto_step.is_none());
+            if !ended_row {
+                assert_eq!(r.phase, Phase::Row, "the guide moved by itself");
+            }
+            // Once the next row has a couple of tiles, the user presses "mapping finished".
+            if finish_at.is_none() && an.tile_count() >= 6 {
+                an.finish();
+                finish_at = Some(an.tile_count());
+            }
             // At the first row end (long pause, offset since the last tile), the user presses "end row"
             // (the state reads `Move` there: the offset is below the 65 % trigger, so only stability counts)
             if !ended_row && r.tiles >= 3 && r.offset_frac > 0.1 && r.stable_secs > 1.0 {
@@ -475,7 +336,9 @@ mod tests {
         }
         assert!(ended_row, "the row end was never reached");
         assert!(an.guide.rows_done >= 1, "the manual end-of-row did not advance the guide");
-        assert!(an.tile_count() >= 5, "the closing capture and the next row were not captured");
+        let at = finish_at.expect("the next row was not captured");
+        assert!(an.guide.finished, "\"mapping finished\" did not finish the map");
+        assert!(an.tile_count() <= at + 1, "tiles kept being captured after the finish");
     }
 
     /// Among the frames of a stable stretch, the sharpest one is what gets saved.

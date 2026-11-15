@@ -29,18 +29,14 @@ pub enum Event {
 pub enum Control {
     Pause(bool),
     UndoLast,
-    /// Manual: the row ends here.
+    /// The row ends here.
     EndRow,
-    /// Manual: the map is complete.
+    /// The map is complete.
     Finish,
-    /// Manual: flip the row direction.
+    /// Flip the row direction.
     Reverse,
-    /// The last automatic edge step was wrong: revert it and ignore that appearance.
-    NotEdge,
     /// Resume mapping after a finish.
     Resume,
-    /// Turn automatic edge detection on or off.
-    AutoDetect(bool),
     Stop,
 }
 
@@ -168,9 +164,7 @@ impl Pipeline {
                                 Control::EndRow => an.end_row(),
                                 Control::Finish => an.finish(),
                                 Control::Reverse => an.reverse(),
-                                Control::NotEdge => an.not_an_edge(),
                                 Control::Resume => an.resume(),
-                                Control::AutoDetect(on) => an.auto_detect = on,
                                 Control::Stop => return,
                             }
                         }
@@ -248,10 +242,7 @@ fn empty_report(frame: &RgbImage, tiles: usize) -> Report {
         heading: Some((1.0, 0.0)),
         row_dir: 1.0,
         phase: crate::guidance::Phase::Row,
-        edge_ahead: 0.0,
-        auto_step: None,
         rows_done: 0,
         finished: false,
-        auto_detect: true,
     }
 }

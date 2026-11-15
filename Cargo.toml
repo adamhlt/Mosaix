@@ -1,0 +1,46 @@
+[package]
+name = "pcb-mapper"
+version = "0.1.0"
+edition = "2021"
+description = "Cartographie haute résolution de PCB au microscope (capture + assemblage en direct)"
+license = "MIT"
+
+[lib]
+name = "pcb_mapper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pcb-mapper"
+path = "src/main.rs"
+required-features = ["ui"]
+
+[features]
+default = ["ui", "camera"]
+# Rune UI (disable to test the core logic only: --no-default-features)
+ui = ["dep:rune"]
+# nokhwa camera backend (Media Foundation on Windows)
+camera = ["dep:nokhwa"]
+
+[dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
+rustfft = "6.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+nokhwa = { version = "0.10.11", features = ["input-native"], optional = true }
+rune = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af", features = ["native-file-dialog"], optional = true }
+
+[profile.dev]
+# La FFT et le laplacien sont inutilisables en debug non optimisé
+opt-level = 2
+
+# Rune embarque des versions patchées de quelques crates (vendor/ dans son dépôt) ;
+# un [patch] de dépendance ne se propage pas, il faut donc le répéter ici.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }

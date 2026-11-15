@@ -9,7 +9,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use image::RgbImage;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Message sent to the UI after each analysed frame.
@@ -50,6 +50,7 @@ pub struct Pipeline {
     pub events: Receiver<Event>,
     ctrl: Sender<Control>,
     stop: Arc<AtomicBool>,
+    session_dir: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// Non-blocking send into a capacity-1 channel: replaces the old item if it is still there.
@@ -80,6 +81,8 @@ impl Pipeline {
         let (ctrl_tx, ctrl_rx) = unbounded::<Control>();
         let wake = Arc::new(wake);
         let stop = Arc::new(AtomicBool::new(false));
+        let session_dir: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let session_dir_thread = session_dir.clone();
         // The demo source has no one to click: let it confirm suggestions by itself.
         let auto_confirm = matches!(spec, SourceSpec::Synthetic);
 
@@ -138,6 +141,9 @@ impl Pipeline {
                     let session = session_root.as_deref().and_then(|root| match Session::create(root) {
                         Ok(s) => {
                             tracing::info!("session: {}", s.dir().display());
+                            if let Ok(mut g) = session_dir_thread.lock() {
+                                *g = Some(s.dir().to_path_buf());
+                            }
                             Some(s)
                         }
                         Err(e) => {
@@ -211,7 +217,12 @@ impl Pipeline {
                 .expect("failed to start the analysis thread");
         }
 
-        Self { events: ev_rx, ctrl: ctrl_tx, stop }
+        Self { events: ev_rx, ctrl: ctrl_tx, stop, session_dir }
+    }
+
+    /// Folder of the session being recorded (None when saving is off or not created yet).
+    pub fn session_dir(&self) -> Option<PathBuf> {
+        self.session_dir.lock().ok().and_then(|g| g.clone())
     }
 
     pub fn send(&self, c: Control) {

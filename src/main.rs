@@ -3,12 +3,15 @@
 //!
 //! CLI flags skip the menu: `--demo`, `--replay <dir> [--fps N]`,
 //! `--camera <index> [--res WxH] [--yuyv]`. `--no-save` disables session saving.
+//! Headless export of a saved session: `--export <session_dir> <out.png|jpg|tif> [--scale 0.5]
+//! [--crop] [--no-refine]`.
 //! UI testing without any source: `--fake stabilize|move|lost|suggest-row|suggest-finish|closing|finished`
 //! shows a frozen state.
 
 use pcb_mapper::analysis::Report;
 use pcb_mapper::camera::SourceSpec;
 use pcb_mapper::capture::{Params, State as CaptureState};
+use pcb_mapper::export::{export_session, ExportOptions, ExportResult, Progress};
 use pcb_mapper::guidance::{Phase, Suggestion, Then};
 use pcb_mapper::mosaic::Preview;
 use pcb_mapper::pipeline::{Control, Event, Pipeline};
@@ -58,6 +61,14 @@ struct MenuState {
     error: Option<String>,
 }
 
+/// A running export (background thread).
+struct ExportJob {
+    progress: Arc<Progress>,
+    result: Arc<Mutex<Option<Result<ExportResult, String>>>>,
+}
+
+const EXPORT_SCALES: [(f32, &str); 3] = [(1.0, "100 %"), (0.5, "50 %"), (0.25, "25 %")];
+
 #[derive(PartialEq)]
 enum Screen {
     Menu,
@@ -78,6 +89,10 @@ struct App {
     ended: Option<String>,
     details_open: bool,
     auto_detect: bool,
+    export: Option<ExportJob>,
+    export_msg: Option<(String, bool)>,
+    export_crop: bool,
+    export_scale: usize,
     initial: Option<(SourceSpec, bool)>,
     fps_frames: u32,
     fps_t0: f64,
@@ -178,8 +193,12 @@ fn state() -> App {
         preview: None,
         paused: false,
         ended: None,
-        details_open: true,
+        details_open: false,
         auto_detect: true,
+        export: None,
+        export_msg: None,
+        export_crop: false,
+        export_scale: 0,
         initial: spec.map(|s| (s, save)),
         fps_frames: 0,
         fps_t0: 0.0,
@@ -236,6 +255,29 @@ fn back_to_menu(s: &mut App) {
 /// Drains messages from the analysis thread; `true` when the view must be rebuilt.
 fn poll(s: &mut App, clock: f64, _: &mut Tx) -> bool {
     let mut dirty = s.screen == Screen::Menu; // camera list may have changed
+    // Export thread: keep the progress moving, collect the result.
+    let finished = s.export.as_ref().and_then(|j| j.result.lock().ok().and_then(|mut g| g.take()));
+    if s.export.is_some() {
+        dirty = true;
+    }
+    if let Some(r) = finished {
+        s.export_msg = Some(match r {
+            Ok(r) => (
+                format!(
+                    "Saved {} — {}×{} px, {} tiles, {} overlaps aligned (max correction {:.1} px)",
+                    r.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    r.width,
+                    r.height,
+                    r.tiles,
+                    r.pairs_used,
+                    r.max_correction
+                ),
+                true,
+            ),
+            Err(e) => (e, false),
+        });
+        s.export = None;
+    }
     let Some(p) = &s.pipeline else { return dirty };
     while let Ok(ev) = p.events.try_recv() {
         dirty = true;
@@ -275,6 +317,48 @@ fn rgb_to_rgba(img: &image::RgbImage) -> Vec<u8> {
         out.extend_from_slice(&[p[0], p[1], p[2], 255]);
     }
     out
+}
+
+/// Starts an export of `session_dir` into `out` on a background thread.
+fn start_export(s: &mut App, session_dir: PathBuf, out: PathBuf) {
+    let Some(waker) = s.waker.clone() else { return };
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || waker());
+    let progress = Progress::new(Some(wake.clone()));
+    let result: Arc<Mutex<Option<Result<ExportResult, String>>>> = Arc::new(Mutex::new(None));
+    let opts = ExportOptions { crop: s.export_crop, scale: EXPORT_SCALES[s.export_scale].0, ..Default::default() };
+    s.export_msg = None;
+    s.export = Some(ExportJob { progress: progress.clone(), result: result.clone() });
+    std::thread::spawn(move || {
+        let r = export_session(&session_dir, &out, &opts, &progress).map_err(|e| format!("{e:#}"));
+        if let Ok(mut g) = result.lock() {
+            *g = Some(r);
+        }
+        wake();
+    });
+}
+
+/// Asks where to save, then exports `session_dir` there.
+fn ask_output(tx: &mut Tx, session_dir: PathBuf) {
+    let options = FileDialogOptions { title: "Export the mosaic".into(), ..Default::default() }
+        .filter("PNG image", &["png"])
+        .filter("JPEG image", &["jpg", "jpeg"])
+        .filter("TIFF image", &["tif", "tiff"]);
+    tx.save_file(options, move |s: &mut App, result, _tx| match result {
+        Ok(Some(mut path)) => {
+            if path.extension().is_none() {
+                path.set_extension("png");
+            }
+            start_export(s, session_dir, path);
+        }
+        Ok(None) => {}
+        Err(e) => s.export_msg = Some((e.to_string(), false)),
+    });
+}
+
+fn cancel_export(s: &mut App) {
+    if let Some(j) = &s.export {
+        j.progress.cancel();
+    }
 }
 
 fn toggle_pause(s: &mut App) {
@@ -414,6 +498,77 @@ fn tile(label: &str, value: String) -> El {
         .child(text(value).font(type_::TITLE).color(Color::WHITE))
 }
 
+// ---------------------------------------------------------------- export widgets
+fn export_status(s: &App) -> Option<El> {
+    if let Some(j) = &s.export {
+        Some(
+            col()
+                .w_full()
+                .gap(6.0)
+                .child(
+                    text(format!("{} — {:.0} %", j.progress.stage(), j.progress.fraction() * 100.0))
+                        .font(type_::BODY)
+                        .color(amber()),
+                )
+                .child(button("export-cancel".into(), "Cancel export".into(), cancel_export)),
+        )
+    } else {
+        s.export_msg
+            .as_ref()
+            .map(|(msg, ok)| text(msg.clone()).font(type_::BODY).color(if *ok { green() } else { red() }))
+    }
+}
+
+/// Export block of the side panel: button + crop/scale options + progress or result.
+fn export_panel(s: &App) -> El {
+    let button = el()
+        .key("export".to_string())
+        .role("button")
+        .label("Export mosaic".to_string())
+        .focusable(true)
+        .radius(8.0)
+        .padding(10.0)
+        .fill(tok::accent(0, true))
+        .on_press_tx(|s: &mut App, tx: &mut Tx| {
+            if s.export.is_some() {
+                return;
+            }
+            match s.pipeline.as_ref().and_then(|p| p.session_dir()) {
+                Some(dir) => ask_output(tx, dir),
+                None => {
+                    s.export_msg = Some(("Turn on \"Saving tiles to disk\" in the menu to export".into(), false))
+                }
+            }
+        })
+        .child(text("Export…".to_string()).font(type_::BODY).color(Color::WHITE));
+    let mut c = col()
+        .w_full()
+        .gap(8.0)
+        .child(text("Export".to_string()).font(type_::BODY).color(dim()))
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .child(button)
+                .child(choice(
+                    "export-crop".into(),
+                    format!("Crop {}", if s.export_crop { "on" } else { "off" }),
+                    s.export_crop,
+                    |s: &mut App| s.export_crop = !s.export_crop,
+                ))
+                .child(choice(
+                    "export-scale".into(),
+                    format!("Scale {}", EXPORT_SCALES[s.export_scale].1),
+                    false,
+                    |s: &mut App| s.export_scale = (s.export_scale + 1) % EXPORT_SCALES.len(),
+                )),
+        );
+    if let Some(st) = export_status(s) {
+        c = c.child(st);
+    }
+    c
+}
+
 // ---------------------------------------------------------------- menu
 fn menu_view(s: &App) -> El {
     let t = tok::theme(true);
@@ -508,6 +663,35 @@ fn menu_view(s: &App) -> El {
         )
         .child(primary("start-demo", "Start demo", |s: &mut App| start(s, SourceSpec::Synthetic)));
 
+    // Export section: stitch a previously saved session
+    let mut export = section("Export")
+        .child(
+            text("Stitch the tiles of a saved session into one image.".to_string())
+                .font(type_::BODY)
+                .color(dim()),
+        )
+        .child(
+            el().key("export-session".to_string())
+                .role("button")
+                .label("Export a saved session".to_string())
+                .focusable(true)
+                .radius(8.0)
+                .padding(8.0)
+                .fill(hex("#24252b"))
+                .on_press_tx(|_: &mut App, tx: &mut Tx| {
+                    let options = FileDialogOptions { title: "Choose a session folder".into(), ..Default::default() };
+                    tx.open_folder(options, |s: &mut App, result, tx| match result {
+                        Ok(Some(dir)) => ask_output(tx, dir),
+                        Ok(None) => {}
+                        Err(e) => s.export_msg = Some((e.to_string(), false)),
+                    });
+                })
+                .child(text("Export a saved session…".to_string()).font(type_::BODY).color(Color::WHITE)),
+        );
+    if let Some(st) = export_status(s) {
+        export = export.child(st);
+    }
+
     let save = choice(
         "save-toggle".into(),
         if s.menu.save { "Saving tiles to disk: on".into() } else { "Saving tiles to disk: off".into() },
@@ -526,6 +710,7 @@ fn menu_view(s: &App) -> El {
         .child(cams)
         .child(replay)
         .child(demo)
+        .child(export)
         .child(save);
     if let Some(e) = &s.menu.error {
         panel = panel.child(text(e.clone()).font(type_::BODY).color(red()));
@@ -835,7 +1020,7 @@ fn running_view(s: &App) -> El {
             s.auto_detect,
             toggle_auto,
         ));
-    panel = panel.child(spacer()).child(guidance).child(
+    panel = panel.child(spacer()).child(export_panel(s)).child(guidance).child(
         col()
             .w_full()
             .gap(8.0)
@@ -862,7 +1047,63 @@ fn view(s: &App, _: &mut Cx<App>) -> El {
     }
 }
 
+/// `--export <session_dir> <out> [--scale N] [--crop] [--no-refine]`: no window.
+fn cli_export(args: &[String]) -> Option<i32> {
+    let at = args.iter().position(|a| a == "--export")?;
+    let (Some(dir), Some(out)) = (args.get(at + 1), args.get(at + 2)) else {
+        eprintln!("usage: pcb-mapper --export <session_dir> <out.png|jpg|tif> [--scale 0.5] [--crop] [--no-refine]");
+        return Some(2);
+    };
+    let mut opts = ExportOptions::default();
+    if let Some(i) = args.iter().position(|a| a == "--scale") {
+        opts.scale = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    }
+    opts.crop = args.iter().any(|a| a == "--crop");
+    opts.refine = !args.iter().any(|a| a == "--no-refine");
+    let progress = Progress::new(None);
+    let watcher = {
+        let p = progress.clone();
+        std::thread::spawn(move || {
+            let mut last = String::new();
+            while p.fraction() < 1.0 && !p.is_cancelled() {
+                let line = format!("{} — {:.0} %", p.stage(), p.fraction() * 100.0);
+                if line != last {
+                    eprintln!("{line}");
+                    last = line;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        })
+    };
+    let result = export_session(std::path::Path::new(dir), std::path::Path::new(out), &opts, &progress);
+    progress.cancel(); // stops the progress printer
+    let _ = watcher.join();
+    match result {
+        Ok(r) => {
+            println!(
+                "{}: {}x{} px (scale {:.2}), {} tiles, {} overlaps aligned, max correction {:.1} px",
+                r.path.display(),
+                r.width,
+                r.height,
+                r.scale,
+                r.tiles,
+                r.pairs_used,
+                r.max_correction
+            );
+            Some(0)
+        }
+        Err(e) => {
+            eprintln!("export failed: {e:#}");
+            Some(1)
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = cli_export(&args) {
+        std::process::exit(code);
+    }
     tracing_subscriber::fmt().init();
     rune::run(AppSpec {
         setup: Some(setup),

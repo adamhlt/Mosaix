@@ -47,8 +47,35 @@ fn hann(n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Tukey (tapered-cosine) window: flat in the middle, cosine taper over a fraction `alpha` of the
+/// length (`alpha = 1` is a Hann window). Keeps more of the image than Hann, which matters when
+/// the overlap between two images sits near their borders.
+fn tukey(n: usize, alpha: f32) -> Vec<f32> {
+    let edge = (alpha.clamp(0.01, 1.0) * n as f32 / 2.0).max(1.0);
+    (0..n)
+        .map(|i| {
+            let x = i as f32 + 0.5;
+            let d = x.min(n as f32 - x);
+            if d >= edge {
+                1.0
+            } else {
+                0.5 - 0.5 * (std::f32::consts::PI * d / edge).cos()
+            }
+        })
+        .collect()
+}
+
 impl PhaseCorrelator {
     pub fn new(w: usize, h: usize) -> Self {
+        Self::with_windows(w, h, hann(w), hann(h))
+    }
+
+    /// Like [`PhaseCorrelator::new`] with a Tukey window tapering over a fraction `alpha` of each side.
+    pub fn new_tapered(w: usize, h: usize, alpha: f32) -> Self {
+        Self::with_windows(w, h, tukey(w, alpha), tukey(h, alpha))
+    }
+
+    fn with_windows(w: usize, h: usize, hann_x: Vec<f32>, hann_y: Vec<f32>) -> Self {
         let mut p = FftPlanner::<f32>::new();
         Self {
             w,
@@ -57,8 +84,8 @@ impl PhaseCorrelator {
             fft_col: p.plan_fft_forward(h),
             ifft_row: p.plan_fft_inverse(w),
             ifft_col: p.plan_fft_inverse(h),
-            hann_x: hann(w),
-            hann_y: hann(h),
+            hann_x,
+            hann_y,
             buf_a: vec![Complex::new(0.0, 0.0); w * h],
             buf_b: vec![Complex::new(0.0, 0.0); w * h],
             tmp: vec![Complex::new(0.0, 0.0); w * h],

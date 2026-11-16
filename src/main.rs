@@ -220,7 +220,7 @@ fn apply_fake(app: &mut App, kind: &str) {
         app.updater.state = update::State::Available(update::Offer { release, method: update::Method::Portable, asset: Some(asset) });
     }
     if kind == "dialog" {
-        app.export_dialog = Some(PathBuf::from("sessions/session-1794758298"));
+        app.export_dialog = Some(settings::default_save_dir().join("2026-11-16_19-34-59"));
     }
     app.screen = Screen::Running;
 }
@@ -235,7 +235,7 @@ fn state() -> App {
             modes: Arc::new(Mutex::new(Modes::Idle)),
             res: None,
             format: None,
-            save_dir: PathBuf::from("sessions"),
+            save_dir: settings::save_dir(),
             error: None,
         },
         cams: Arc::new(Mutex::new(CamList::Loading)),
@@ -853,13 +853,28 @@ fn menu_view(s: &App) -> El {
 
     // Save folder: every captured tile and every exported image goes there
     let folder = section("Save folder")
-        .child(text("Captured tiles and exported images are stored here.".to_string()).font(type_::BODY).color(dim()))
+        .child(
+            text("Each session gets its own folder here, named after its date and time, with its tiles and exported mosaics.".to_string())
+                .font(type_::BODY)
+                .color(dim())
+                .w_full()
+                .wrap(),
+        )
         .child(
             row()
                 .w_full()
                 .gap(8.0)
-                .child(text(s.menu.save_dir.display().to_string()).font(type_::BODY).color(soft()))
-                .child(spacer())
+                .items_center()
+                .child(
+                    el().grow(1.0)
+                        .min_w(0.0)
+                        .child(text(s.menu.save_dir.display().to_string()).font(type_::BODY).color(soft()).truncate_head()),
+                )
+                .child(button("open-folder".into(), "Open".into(), |s: &mut App| {
+                    if let Err(e) = settings::open_folder(&s.menu.save_dir) {
+                        s.menu.error = Some(e);
+                    }
+                }))
                 .child(
                     el().key("pick-folder".to_string())
                         .role("button")
@@ -871,7 +886,10 @@ fn menu_view(s: &App) -> El {
                         .on_press_tx(|_: &mut App, tx: &mut Tx| {
                             let options = FileDialogOptions { title: "Choose the save folder".into(), ..Default::default() };
                             tx.open_folder(options, |s: &mut App, result, _tx| match result {
-                                Ok(Some(path)) => s.menu.save_dir = path,
+                                Ok(Some(path)) => {
+                                    settings::store_save_dir(&path);
+                                    s.menu.save_dir = path;
+                                }
                                 Ok(None) => {}
                                 Err(e) => s.menu.error = Some(e.to_string()),
                             });
@@ -1408,6 +1426,56 @@ fn cli_grab(args: &[String]) -> Option<i32> {
     }
     println!("{:.1} ms per frame", t0.elapsed().as_secs_f64() * 1000.0 / frames as f64);
     Some(0)
+}
+
+/// Where sessions go, kept between launches.
+mod settings {
+    use std::path::{Path, PathBuf};
+
+    /// The OS's Pictures folder (`C:\Users\…\Pictures`, `~/Pictures`, the XDG pictures folder
+    /// on Linux, localised there), else the home folder, followed by `Mosaix`.
+    pub fn default_save_dir() -> PathBuf {
+        dirs::picture_dir().or_else(dirs::home_dir).map_or_else(|| PathBuf::from("Mosaix"), |d| d.join("Mosaix"))
+    }
+
+    /// `…/Mosaix/settings.json` in the OS's settings folder (`%APPDATA%`,
+    /// `~/Library/Application Support`, `~/.config`).
+    fn file() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("Mosaix").join("settings.json"))
+    }
+
+    /// The folder picked last time, else the default.
+    pub fn save_dir() -> PathBuf {
+        file()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("save_dir").and_then(|d| d.as_str()).map(PathBuf::from))
+            .filter(|d| d.is_absolute())
+            .unwrap_or_else(default_save_dir)
+    }
+
+    /// Remembers `dir` for the next launches (best effort: a read-only settings folder only
+    /// means the choice isn't kept).
+    pub fn store_save_dir(dir: &Path) {
+        let Some(f) = file() else { return };
+        if let Some(parent) = f.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(f, serde_json::json!({ "save_dir": dir }).to_string());
+    }
+
+    /// Shows `dir` in the file manager, creating it first so there is something to open.
+    pub fn open_folder(dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Can't create {}: {e}", dir.display()))?;
+        let program = if cfg!(windows) {
+            "explorer"
+        } else if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(program).arg(dir).spawn().map(drop).map_err(|e| format!("Can't open {}: {e}", dir.display()))
+    }
 }
 
 /// A windowed app has no console: the command-line modes write to the terminal they were

@@ -42,7 +42,7 @@ boards, microscope slides, documents and any other flat, textured surface.
 **Export**
 - PNG, JPEG or TIFF, at 100 %, 50 % or 25 %
 - The whole mosaic, or cropped to the largest fully covered rectangle
-- Every session (tiles and their positions) is saved, and can be exported again later
+- Every session (tiles and their positions) is saved in its own dated folder, by default in `Pictures/Mosaix`, and can be exported again later
 
 <p align="center"><a href="docs/pcb.png"><img src="docs/pcb.jpg" alt="A whole Ettus Research B205mini-i radio board, stitched by Mosaïx from tiles taken by hand under a USB microscope"></a></p>
 <p align="center"><sub>An Ettus Research B205mini-i board, moved by hand under a USB microscope and stitched by Mosaïx (shown reduced; <a href="docs/pcb.png">full size, 6840 × 4470 px</a>).</sub></p>
@@ -69,7 +69,7 @@ boards, microscope slides, documents and any other flat, textured surface.
 ```bash
 mosaix --camera 0 --res 1920x1080            # skip the start menu
 mosaix --list-modes                          # every camera and the modes its driver offers
-mosaix --export sessions/session-123 out.png --scale 0.5 --crop   # stitch a saved session, no window
+mosaix --export ~/Pictures/Mosaix/2026-11-16_19-34-59 out.png --scale 0.5 --crop   # stitch a saved session, no window
 ```
 
 ## Download

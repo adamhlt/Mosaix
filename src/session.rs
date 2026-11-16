@@ -28,10 +28,14 @@ pub struct Session {
 }
 
 impl Session {
-    /// Creates `root/session-<timestamp>/` with its `tiles/` subfolder.
+    /// Creates `root/<local date and time>/` (`2026-11-16_19-34-59`, `-2`, `-3`… when one already
+    /// exists) with its `tiles/` subfolder. The names sort in the order the sessions were made.
     pub fn create(root: &Path) -> Result<Self> {
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let dir = root.join(format!("session-{stamp}"));
+        let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+        let dir = std::iter::once(root.join(&stamp))
+            .chain((2..).map(|n| root.join(format!("{stamp}-{n}"))))
+            .find(|d| !d.exists())
+            .expect("an unused name exists");
         std::fs::create_dir_all(dir.join("tiles")).with_context(|| format!("creating {}", dir.display()))?;
         let s = Self { dir, meta: SessionMeta { version: 1, tiles: vec![] }, next_id: 1 };
         s.write_meta()?;
@@ -94,6 +98,25 @@ mod tests {
         s.remove_last().unwrap();
         assert!(!s.dir().join("tiles/00002.png").exists());
         assert_eq!(Session::open(s.dir()).unwrap().meta.tiles.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sessions_are_named_by_date_and_never_collide() {
+        let root = std::env::temp_dir().join(format!("mosaix-names-{}", std::process::id()));
+        let a = Session::create(&root).unwrap();
+        let b = Session::create(&root).unwrap();
+        assert_ne!(a.dir(), b.dir());
+        let name = a.dir().file_name().unwrap().to_string_lossy().to_string();
+        // 2026-11-16_19-34-59
+        assert_eq!(name.len(), 19, "{name}");
+        assert!(name.chars().enumerate().all(|(i, c)| if [4, 7, 13, 16].contains(&i) {
+            c == '-'
+        } else if i == 10 {
+            c == '_'
+        } else {
+            c.is_ascii_digit()
+        }));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

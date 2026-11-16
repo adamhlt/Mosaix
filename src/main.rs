@@ -1450,10 +1450,10 @@ fn main() {
     if let Err(e) = rune::set_app_icon(include_bytes!("../assets/icon/icon-macos.png").as_slice()) {
         eprintln!("mosaix: {e}");
     }
-    rune::run(AppSpec {
-        setup: Some(setup),
-        poll: Some(poll),
-        on_key: Some(on_key),
-        ..AppSpec::new(APP_NAME, (1280.0, 780.0), state, view)
-    });
+    let spec =
+        AppSpec { setup: Some(setup), poll: Some(poll), on_key: Some(on_key), ..AppSpec::new(APP_NAME, (1280.0, 780.0), state, view) };
+    // macOS: a standard titled window. Rune's default draws the content under a transparent
+    // titlebar, so the traffic lights and the titlebar band would cover the top of the view.
+    // Windows and Linux keep their native frame either way.
+    rune::App::new(spec).chrome(rune::Chrome { full_size_content: false, ..rune::Chrome::DEFAULT }).run();
 }

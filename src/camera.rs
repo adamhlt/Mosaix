@@ -313,6 +313,24 @@ pub mod nokhwa_source {
     use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution};
     use nokhwa::Camera;
 
+    /// macOS: asks the user for camera access (once: the answer is remembered) and waits for
+    /// it. Without it AVFoundation lists the cameras but opens none, and never asks by itself.
+    /// Elsewhere nokhwa reports access at once. Call it from a worker thread.
+    pub fn request_access() -> Result<()> {
+        if nokhwa::nokhwa_check() {
+            return Ok(());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        nokhwa::nokhwa_initialize(move |granted| {
+            let _ = tx.send(granted);
+        });
+        if rx.recv().unwrap_or(false) {
+            Ok(())
+        } else {
+            anyhow::bail!("camera access denied: allow Mosaïx in System Settings › Privacy & Security › Camera")
+        }
+    }
+
     /// Lists the detected cameras: `(index, name)`. The index is the device's own (on Linux,
     /// `N` of `/dev/videoN`).
     pub fn list_cameras() -> Result<Vec<(u32, String)>> {
@@ -433,6 +451,7 @@ pub mod nokhwa_source {
     /// Asks the driver which resolutions and formats the camera really offers, largest first.
     /// The device is opened (not streamed) for the query, so call it from a worker thread.
     pub fn list_modes(index: u32) -> Result<Vec<Mode>> {
+        request_access()?;
         #[cfg(target_os = "linux")]
         v4l_fix::prepare(index, None);
         let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
@@ -465,6 +484,7 @@ pub mod nokhwa_source {
 
     impl NokhwaSource {
         pub fn open(index: u32, width: u32, height: u32, fps: u32, format: PixelFormat) -> Result<Self> {
+            request_access()?;
             #[cfg(target_os = "linux")]
             v4l_fix::prepare(index, Some((width, height, format, fps)));
             let fmt = CameraFormat::new(Resolution::new(width, height), to_nokhwa(format), fps);

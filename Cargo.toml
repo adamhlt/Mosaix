@@ -19,7 +19,7 @@ default = ["ui", "camera"]
 # Rune UI and the self-updater (disable to test the core logic only: --no-default-features)
 ui = ["dep:rune", "dep:ureq", "dep:sha2", "dep:zip", "dep:flate2", "dep:tar"]
 # nokhwa camera backend (Media Foundation on Windows)
-camera = ["dep:nokhwa", "dep:v4l"]
+camera = ["dep:nokhwa", "dep:v4l", "dep:nokhwa-bindings-macos"]
 
 [dependencies]
 anyhow = "1.0"
@@ -38,6 +38,10 @@ zip = { version = "2", default-features = false, features = ["deflate"], optiona
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
 rune = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af", features = ["native-file-dialog"], optional = true }
+
+# macOS: lists a camera's formats straight from AVFoundation (same crate nokhwa uses).
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa-bindings-macos = { version = "0.2.4", optional = true }
 
 # Linux: sets a whole frame rate on the device before nokhwa opens it (same crate nokhwa uses).
 [target.'cfg(target_os = "linux")'.dependencies]

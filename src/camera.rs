@@ -448,15 +448,31 @@ pub mod nokhwa_source {
         }
     }
 
+    /// Every format the camera offers (resolution, pixel format, frame rate).
+    #[cfg(not(target_os = "macos"))]
+    fn camera_formats(index: u32) -> Result<Vec<CameraFormat>> {
+        let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+        let mut cam = Camera::new(CameraIndex::Index(index), req)?;
+        Ok(cam.compatible_camera_formats()?)
+    }
+
+    /// macOS: reads the formats straight from AVFoundation. nokhwa's own list keeps the formats
+    /// whose pixel format *differs* from the one asked for (an inverted filter in its
+    /// AVFoundation backend), so a camera with a single pixel format (the FaceTime cameras:
+    /// every mode maps to YUYV) came back with no mode at all.
+    #[cfg(target_os = "macos")]
+    fn camera_formats(index: u32) -> Result<Vec<CameraFormat>> {
+        let device = nokhwa_bindings_macos::AVCaptureDevice::new(&CameraIndex::Index(index))?;
+        Ok(device.supported_formats()?)
+    }
+
     /// Asks the driver which resolutions and formats the camera really offers, largest first.
     /// The device is opened (not streamed) for the query, so call it from a worker thread.
     pub fn list_modes(index: u32) -> Result<Vec<Mode>> {
         request_access()?;
         #[cfg(target_os = "linux")]
         v4l_fix::prepare(index, None);
-        let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
-        let mut cam = Camera::new(CameraIndex::Index(index), req)?;
-        let formats = cam.compatible_camera_formats()?;
+        let formats = camera_formats(index)?;
         let mut modes: Vec<Mode> = Vec::new();
         for f in formats {
             let (w, h) = (f.resolution().width(), f.resolution().height());

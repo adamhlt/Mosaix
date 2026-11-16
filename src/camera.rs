@@ -313,10 +313,99 @@ pub mod nokhwa_source {
     use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution};
     use nokhwa::Camera;
 
-    /// Lists the detected cameras: `(index, name)`.
+    /// Lists the detected cameras: `(index, name)`. The index is the device's own (on Linux,
+    /// `N` of `/dev/videoN`).
     pub fn list_cameras() -> Result<Vec<(u32, String)>> {
         let infos = nokhwa::query(nokhwa::utils::ApiBackend::Auto)?;
-        Ok(infos.into_iter().enumerate().map(|(i, c)| (i as u32, c.human_name())).collect())
+        let mut cams: Vec<(u32, String)> =
+            infos.into_iter().enumerate().map(|(i, c)| (c.index().as_index().unwrap_or(i as u32), c.human_name())).collect();
+        // Linux: a USB camera also adds a metadata node that films nothing; keep the nodes that
+        // offer a picture format nokhwa reads.
+        #[cfg(target_os = "linux")]
+        cams.retain(|(i, _)| v4l_fix::can_capture(*i));
+        cams.sort_by_key(|(i, _)| *i);
+        Ok(cams)
+    }
+
+    /// Linux: nokhwa reads the device's *current* mode before applying the requested one, and
+    /// gives up when that mode is in a format it can't read (a camera left in H.264) or at a
+    /// frame rate that isn't a whole number (one left at 7.5 fps, `2/15` s per frame). These
+    /// helpers put the device in a mode nokhwa accepts first; V4L2 keeps it once the device is
+    /// closed. Best effort: what still fails is left for nokhwa to report.
+    #[cfg(target_os = "linux")]
+    mod v4l_fix {
+        use super::PixelFormat;
+        use v4l::frameinterval::FrameIntervalEnum;
+        use v4l::framesize::FrameSizeEnum;
+        use v4l::video::{capture::Parameters, Capture};
+        use v4l::{Device, Format, FourCC};
+
+        /// The formats nokhwa decodes (`fourcc_to_frameformat` in its V4L2 backend).
+        const READABLE: [&[u8; 4]; 6] = [b"MJPG", b"YUYV", b"NV12", b"GRAY", b"RGB3", b"BGR3"];
+
+        fn readable(f: FourCC) -> bool {
+            READABLE.iter().any(|r| FourCC::new(r) == f)
+        }
+
+        fn fourcc(pf: PixelFormat) -> FourCC {
+            FourCC::new(match pf {
+                PixelFormat::Mjpeg => b"MJPG",
+                PixelFormat::Yuyv => b"YUYV",
+                PixelFormat::Nv12 => b"NV12",
+                PixelFormat::Gray => b"GRAY",
+                PixelFormat::RawRgb => b"RGB3",
+                PixelFormat::RawBgr => b"BGR3",
+            })
+        }
+
+        /// Whether `/dev/video<index>` offers a picture format nokhwa reads (a metadata node
+        /// offers none).
+        pub fn can_capture(index: u32) -> bool {
+            Device::new(index as usize).and_then(|d| d.enum_formats()).is_ok_and(|f| f.iter().any(|d| readable(d.fourcc)))
+        }
+
+        /// Whether the device's current mode is one nokhwa accepts.
+        fn usable(dev: &Device) -> bool {
+            dev.format().is_ok_and(|f| readable(f.fourcc)) && dev.params().is_ok_and(|p| p.interval.numerator == 1)
+        }
+
+        /// Puts the device on `wanted` (width, height, format, fps) if given, else, or if the
+        /// driver refuses, on the readable mode with a whole frame rate it lists first (MJPEG
+        /// first: lightest on the bus).
+        pub fn prepare(index: u32, wanted: Option<(u32, u32, PixelFormat, u32)>) {
+            let Ok(dev) = Device::new(index as usize) else { return };
+            if let Some((w, h, pf, fps)) = wanted {
+                let _ = dev.set_format(&Format::new(w, h, fourcc(pf)));
+                let _ = dev.set_params(&Parameters::with_fps(fps.max(1)));
+            }
+            if usable(&dev) {
+                return;
+            }
+            let mut formats: Vec<FourCC> =
+                dev.enum_formats().unwrap_or_default().into_iter().map(|d| d.fourcc).filter(|f| readable(*f)).collect();
+            formats.sort_by_key(|f| *f != FourCC::new(b"MJPG"));
+            for f in formats {
+                for size in dev.enum_framesizes(f).unwrap_or_default() {
+                    let FrameSizeEnum::Discrete(d) = size.size else { continue };
+                    let best = dev
+                        .enum_frameintervals(f, d.width, d.height)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|i| match i.interval {
+                            FrameIntervalEnum::Discrete(fr) if fr.numerator == 1 && fr.denominator > 0 => Some(fr.denominator),
+                            _ => None,
+                        })
+                        .max();
+                    if let Some(fps) = best {
+                        let _ = dev.set_format(&Format::new(d.width, d.height, f));
+                        let _ = dev.set_params(&Parameters::with_fps(fps));
+                        if usable(&dev) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn to_nokhwa(f: PixelFormat) -> FrameFormat {
@@ -344,6 +433,8 @@ pub mod nokhwa_source {
     /// Asks the driver which resolutions and formats the camera really offers, largest first.
     /// The device is opened (not streamed) for the query, so call it from a worker thread.
     pub fn list_modes(index: u32) -> Result<Vec<Mode>> {
+        #[cfg(target_os = "linux")]
+        v4l_fix::prepare(index, None);
         let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
         let mut cam = Camera::new(CameraIndex::Index(index), req)?;
         let formats = cam.compatible_camera_formats()?;
@@ -374,6 +465,8 @@ pub mod nokhwa_source {
 
     impl NokhwaSource {
         pub fn open(index: u32, width: u32, height: u32, fps: u32, format: PixelFormat) -> Result<Self> {
+            #[cfg(target_os = "linux")]
+            v4l_fix::prepare(index, Some((width, height, format, fps)));
             let fmt = CameraFormat::new(Resolution::new(width, height), to_nokhwa(format), fps);
             // The modes come from the driver, so ask for exactly that one (resolution, pixel
             // format and frame rate); fall back to the closest only if the driver refuses.

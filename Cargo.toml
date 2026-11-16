@@ -19,7 +19,7 @@ default = ["ui", "camera"]
 # Rune UI and the self-updater (disable to test the core logic only: --no-default-features)
 ui = ["dep:rune", "dep:ureq", "dep:sha2", "dep:zip", "dep:flate2", "dep:tar"]
 # nokhwa camera backend (Media Foundation on Windows)
-camera = ["dep:nokhwa"]
+camera = ["dep:nokhwa", "dep:v4l"]
 
 [dependencies]
 anyhow = "1.0"
@@ -38,6 +38,10 @@ zip = { version = "2", default-features = false, features = ["deflate"], optiona
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
 rune = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af", features = ["native-file-dialog"], optional = true }
+
+# Linux: sets a whole frame rate on the device before nokhwa opens it (same crate nokhwa uses).
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = { version = "0.14", optional = true }
 
 [profile.dev]
 # La FFT et le laplacien sont inutilisables en debug non optimisé

@@ -87,8 +87,12 @@ the camera permission on first use.
 ## Build
 
 ```bash
+git clone --recurse-submodules git@github.com:adamhlt/Mosaix.git
 cargo run --release
 ```
+
+The UI uses the [Basalt](https://github.com/adamhlt/Rune-Basalt) design system, a git submodule in
+`themes/rune-basalt`: in an existing clone, `git submodule update --init` fetches it.
 
 - **Toolchain**: `rust-toolchain.toml` pins the Rust version; rustup installs it on first use.
 - **Linux**: needs `libxkbcommon-dev`, `libwayland-dev` and `libclang-dev`.

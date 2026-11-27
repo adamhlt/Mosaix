@@ -456,7 +456,7 @@ impl Grids {
                 let mut s = [0u32; 3];
                 for y in cy * g..(cy + 1) * g {
                     let row = &raw[y * stride + cx * g * 3..y * stride + (cx + 1) * g * 3];
-                    for p in row.chunks_exact(3) {
+                    for p in row.as_chunks::<3>().0 {
                         s[0] += p[0] as u32;
                         s[1] += p[1] as u32;
                         s[2] += p[2] as u32;

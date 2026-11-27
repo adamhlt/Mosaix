@@ -19,11 +19,13 @@ use mosaix::export::{export_session, ExportOptions, ExportResult, Format, Progre
 use mosaix::guidance::{Phase, Then};
 use mosaix::mosaic::Preview;
 use mosaix::pipeline::{Control, Event, Pipeline};
-use rune::tok::{self, type_};
 use rune::{
-    canvas, col, el, row, spacer, text, AppSpec, Color, Cx, El, FileDialogOptions, Key, KeyEvent, Pixels, PopupMenu, Shape, SurfaceFit, Tx,
-    Waker,
+    canvas, col, el, icon, row, spacer, text, AppSpec, Color, Cx, El, FileDialogOptions, Icon, Key, KeyEvent, Pixels, Shape, SurfaceFit,
+    TextStyle, Tx, Waker,
 };
+use rune_basalt::app::{self, Kind, Level, SelectState};
+use rune_basalt::icons::oc;
+use rune_basalt::{tokens, ty, Theme};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -32,8 +34,10 @@ const APP_NAME: &str = "Mosaïx";
 
 /// Max width of the image uploaded to the GPU for the live view.
 const LIVE_MAX_W: u32 = 960;
-const PANEL_W: f32 = 290.0;
-const MOSAIC_BOX: (f32, f32) = (PANEL_W, 160.0);
+const PANEL_W: f32 = 300.0;
+/// The mosaic preview fills the side panel's width, inside its 14-point padding.
+const MOSAIC_BOX: (f32, f32) = (PANEL_W - 28.0, 170.0);
+const MENU_W: f32 = 520.0;
 const GAUGE_W: f32 = 130.0;
 const RETICLE: f32 = 260.0;
 /// Shown when the driver refuses to list its modes: common resolutions in the usual formats.
@@ -46,34 +50,15 @@ fn fallback_modes() -> Vec<Mode> {
 const EXPORT_FORMATS: [(Format, &str, &str); 3] =
     [(Format::Png, "PNG", "png"), (Format::Jpeg, "JPEG", "jpg"), (Format::Tiff, "TIFF", "tif")];
 
-// ---------------------------------------------------------------- colours
-fn hex(s: &str) -> Color {
-    rune::color::hex(s).unwrap_or(Color::WHITE)
+// ---------------------------------------------------------------- theme
+/// Basalt's dark theme with a blue accent: the accent shows where to go (the move arrow, the
+/// frame on the mosaic) while errors keep Basalt's red.
+fn theme() -> Theme {
+    Theme::dark().accent(rune::color::hex("#4c9bff").unwrap_or(Color::WHITE))
 }
-fn amber() -> Color {
-    hex("#f2c14e")
-}
-fn green() -> Color {
-    hex("#5fd68a")
-}
-fn blue() -> Color {
-    hex("#4c9bff")
-}
-fn red() -> Color {
-    hex("#e24b4a")
-}
-fn dim() -> Color {
-    hex("#8d8f98")
-}
-fn soft() -> Color {
-    hex("#c9cbd2")
-}
-fn card() -> Color {
-    hex("#1c1d22")
-}
-fn chip_bg() -> Color {
-    Color::BLACK.alpha(0.72)
-}
+
+/// Title of the export window (Basalt's dialog title).
+const DIALOG_TITLE: TextStyle = TextStyle::new(18.0, 500.0).family(rune_basalt::SANS);
 
 // ---------------------------------------------------------------- state
 #[derive(Clone)]
@@ -130,6 +115,9 @@ struct App {
     paused: bool,
     ended: Option<String>,
     details_open: bool,
+    /// The start menu's camera and resolution lists (open or not, keyboard highlight).
+    cam_select: SelectState,
+    res_select: SelectState,
     export: Option<ExportJob>,
     export_msg: Option<(String, bool)>,
     export_crop: bool,
@@ -248,6 +236,8 @@ fn state() -> App {
         paused: false,
         ended: None,
         details_open: false,
+        cam_select: SelectState::default(),
+        res_select: SelectState::default(),
         export: None,
         export_msg: None,
         export_crop: false,
@@ -484,7 +474,7 @@ fn count(n: usize, noun: &str) -> String {
 
 fn rgb_to_rgba(img: &image::RgbImage) -> Vec<u8> {
     let mut out = Vec::with_capacity(img.as_raw().len() / 3 * 4);
-    for p in img.as_raw().chunks_exact(3) {
+    for p in img.as_raw().as_chunks::<3>().0 {
         out.extend_from_slice(&[p[0], p[1], p[2], 255]);
     }
     out
@@ -587,67 +577,74 @@ fn on_key(s: &mut App, event: &KeyEvent, _: &mut Tx) -> bool {
 }
 
 // ---------------------------------------------------------------- widgets
-fn button(key: String, label: String, on_press: impl Fn(&mut App) + 'static) -> El {
-    el().key(key)
-        .role("button")
-        .label(label.clone())
-        .focusable(true)
-        .radius(8.0)
-        .padding(8.0)
-        .fill(hex("#24252b"))
-        .on_press(on_press)
-        .child(text(label).font(type_::BODY).color(Color::WHITE))
+/// A Basalt button whose press also gets the transaction (Basalt's own only get the state).
+fn button_tx(key: &str, label: &str, kind: Kind, glyph: Option<&'static Icon>, on_press: impl Fn(&mut App, &mut Tx) + 'static) -> El {
+    app::button(label, kind, glyph, None, |_: &mut App| {}).key(key.to_string()).on_press_tx(on_press)
 }
 
-fn primary(key: &str, label: &str, on_press: impl Fn(&mut App) + 'static) -> El {
-    el().key(key.to_string())
-        .role("button")
-        .label(label.to_string())
-        .focusable(true)
-        .radius(8.0)
-        .padding(10.0)
-        .fill(tok::accent(0, true))
-        .on_press(on_press)
-        .child(text(label.to_string()).font(type_::BODY).color(Color::WHITE))
+/// A button taking its column's whole width, its content centred.
+fn wide(b: El) -> El {
+    b.w_full().justify_center()
 }
 
-fn choice(key: String, label: String, selected: bool, on_press: impl Fn(&mut App) + 'static) -> El {
-    el().key(key)
-        .role("button")
-        .label(label.clone())
-        .focusable(true)
-        .radius(8.0)
-        .padding(8.0)
-        .fill(if selected { blue().alpha(0.35) } else { hex("#24252b") })
-        .on_press(on_press)
-        .child(text(label).font(type_::BODY).color(Color::WHITE))
-}
-
-fn section(title: &str) -> El {
-    col().w_full().gap(8.0).child(text(title.to_string()).font(type_::TITLE).color(Color::WHITE))
-}
-
-fn gauge(label: String, frac: f32, color: Color, marker: Option<f32>) -> El {
-    let frac = frac.clamp(0.0, 1.0);
-    let mut bar = el()
-        .w(GAUGE_W)
-        .h(5.0)
-        .radius(3.0)
-        .fill(Color::WHITE.alpha(0.2))
-        .child(el().absolute(0.0, 0.0).w((GAUGE_W * frac).max(1.0)).h(5.0).radius(3.0).fill(color));
-    if let Some(m) = marker {
-        bar = bar.child(el().absolute(GAUGE_W * m, -3.0).w(2.0).h(11.0).fill(Color::WHITE));
-    }
-    col().gap(4.0).child(text(label).font(type_::BODY).color(soft())).child(bar)
-}
-
-fn kv(label: &str, value: String) -> El {
+/// A line of feedback: a dot in the level's colour, then the text (wrapped).
+fn message(msg: &str, level: Level) -> El {
+    let t = tokens();
+    let ink = match level {
+        Level::Err => t.danger,
+        Level::Warn => t.warn,
+        _ => t.muted,
+    };
     row()
         .w_full()
         .gap(8.0)
-        .child(text(label.to_string()).font(type_::BODY).color(dim()))
+        .child(el().pt(6.0).child(app::dot(level)))
+        .child(el().grow(1.0).min_w(0.0).child(text(msg.to_string()).font(app::UI).color(ink).w_full().wrap()))
+}
+
+/// A measurement over the live image: caps caption, value, bar (and a threshold marker).
+fn gauge(label: &str, value: String, frac: f32, color: Color, marker: Option<f32>) -> El {
+    let t = tokens();
+    let frac = frac.clamp(0.0, 1.0);
+    let mut bar = el()
+        .w(GAUGE_W)
+        .h(4.0)
+        .radius(2.0)
+        .fill(t.text.alpha(0.16))
+        .child(el().absolute(0.0, 0.0).w((GAUGE_W * frac).max(1.0)).h(4.0).radius(2.0).fill(color));
+    if let Some(m) = marker {
+        bar = bar.child(el().absolute(GAUGE_W * m - 1.0, -3.0).w(2.0).h(10.0).radius(1.0).fill(t.text));
+    }
+    col()
+        .w(GAUGE_W)
+        .gap(7.0)
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .child(text(label.to_uppercase()).font(app::CAPTION).color(t.muted))
+                .child(spacer())
+                .child(text(value).font(app::TINY).color(t.text)),
+        )
+        .child(bar)
+}
+
+/// A label / value line of the details group.
+fn kv(label: &str, value: String) -> El {
+    let t = tokens();
+    row()
+        .w_full()
+        .h(24.0)
+        .gap(8.0)
+        .items_center()
+        .child(text(label.to_string()).font(app::UI).color(t.muted))
         .child(spacer())
-        .child(text(value).font(type_::BODY).color(soft()))
+        .child(text(value).font(app::UI).color(t.text))
+}
+
+/// A thin horizontal rule.
+fn hrule() -> El {
+    el().w_full().h(1.0).fill(tokens().line)
 }
 
 // ---------------------------------------------------------------- export widgets
@@ -656,26 +653,22 @@ fn export_status(s: &App) -> Option<El> {
         Some(
             col()
                 .w_full()
-                .gap(6.0)
-                .child(text(format!("{} — {:.0} %", j.progress.stage(), j.progress.fraction() * 100.0)).font(type_::BODY).color(amber()))
-                .child(button("export-cancel".into(), "Cancel export".into(), cancel_export)),
+                .gap(8.0)
+                .child(app::progress(&j.progress.stage(), j.progress.fraction()))
+                .child(wide(app::button("Cancel export", Kind::Ghost, Some(&oc::CLOSE), None, cancel_export).key("export-cancel"))),
         )
     } else {
-        s.export_msg.as_ref().map(|(msg, ok)| text(msg.clone()).font(type_::BODY).color(if *ok { green() } else { red() }))
+        s.export_msg.as_ref().map(|(msg, ok)| message(msg, if *ok { Level::Ok } else { Level::Err }))
     }
 }
 
-/// Export block of the side panel: button + crop/scale options + progress or result.
+/// Export block of the side panel: the button, then the progress or the result. The button is
+/// the main action once the map is complete.
 fn export_panel(s: &App) -> El {
-    let button = el()
-        .key("export".to_string())
-        .role("button")
-        .label("Export mosaic".to_string())
-        .focusable(true)
-        .radius(8.0)
-        .padding(10.0)
-        .fill(tok::accent(0, true))
-        .on_press(|s: &mut App| {
+    let finished = s.report.as_ref().is_some_and(|r| r.finished);
+    let kind = if finished { Kind::Primary } else { Kind::Secondary };
+    let button = app::disabled(s.export.is_some(), || {
+        app::button("Export mosaic…", kind, Some(&oc::DOWNLOAD), None, |s: &mut App| {
             if s.export.is_some() {
                 return;
             }
@@ -687,150 +680,126 @@ fn export_panel(s: &App) -> El {
                 None => s.export_msg = Some(("No session folder yet — capture a tile first".into(), false)),
             }
         })
-        .child(text("Export…".to_string()).font(type_::BODY).color(Color::WHITE));
-    let mut c = col().w_full().gap(8.0).child(button);
+        .key("export")
+    });
+    let mut c = col().w_full().gap(10.0).child(wide(button));
     if let Some(st) = export_status(s) {
         c = c.child(st);
     }
     c
 }
 
-/// A combo box: shows the current value; pressing it opens a native pick list.
-fn combo(key: &str, value: String, on_press_tx: impl Fn(&mut App, &mut Tx) + 'static) -> El {
-    el().key(key.to_string())
-        .role("button")
-        .label(value.clone())
-        .focusable(true)
-        .w_full()
-        .radius(8.0)
-        .padding(10.0)
-        .fill(hex("#24252b"))
-        .on_press_tx(on_press_tx)
+/// Options window of the export (format, scale, crop). The images go into the session folder.
+fn export_dialog_view(s: &App, dir: &Path) -> El {
+    let t = tokens();
+    let formats: Vec<&str> = EXPORT_FORMATS.iter().map(|f| f.1).collect();
+    let scales: Vec<&str> = EXPORT_SCALES.iter().map(|f| f.1).collect();
+    let panel = app::floating(col().w(440.0).padding(22.0).gap(18.0))
+        .role("dialog")
+        .label("Export mosaic")
+        .child(
+            col()
+                .w_full()
+                .gap(6.0)
+                .child(text("Export mosaic".to_string()).font(DIALOG_TITLE).color(t.text))
+                .child(text(format!("The image is written to {}", dir.display())).font(app::UI).color(t.muted).w_full().wrap()),
+        )
+        .child(app::field("Format", app::segmented(&formats, s.export_format, |s: &mut App, i| s.export_format = i)))
+        .child(app::field("Size", app::segmented(&scales, s.export_scale, |s: &mut App, i| s.export_scale = i)))
+        .child(app::switch("Crop to the covered rectangle", s.export_crop, |s: &mut App| s.export_crop = !s.export_crop))
         .child(
             row()
                 .w_full()
+                .pt(6.0)
                 .gap(8.0)
-                .child(text(value).font(type_::BODY).color(Color::WHITE))
-                .child(spacer())
-                .child(text("▾".to_string()).font(type_::BODY).color(dim())),
-        )
-}
-
-/// Options window of the export (format, scale, crop). The images go into the session folder.
-fn export_dialog_view(s: &App, dir: &Path) -> El {
-    let mut formats = row().gap(8.0);
-    for (i, (_, label, _)) in EXPORT_FORMATS.iter().enumerate() {
-        formats =
-            formats.child(choice(format!("fmt-{i}"), label.to_string(), s.export_format == i, move |s: &mut App| s.export_format = i));
-    }
-    let mut scales = row().gap(8.0);
-    for (i, (_, label)) in EXPORT_SCALES.iter().enumerate() {
-        scales = scales.child(choice(format!("scale-{i}"), label.to_string(), s.export_scale == i, move |s: &mut App| s.export_scale = i));
-    }
-    let crop = choice(
-        "export-crop".into(),
-        format!("Crop to the covered rectangle: {}", if s.export_crop { "on" } else { "off" }),
-        s.export_crop,
-        |s: &mut App| s.export_crop = !s.export_crop,
-    );
-    let card = col()
-        .w(440.0)
-        .gap(14.0)
-        .padding(24.0)
-        .radius(16.0)
-        .fill(card())
-        .child(text("Export mosaic".to_string()).font(type_::TITLE).color(Color::WHITE))
-        .child(text(format!("The image is written to {}", dir.display())).font(type_::BODY).color(dim()))
-        .child(text("Format".to_string()).font(type_::BODY).color(soft()))
-        .child(formats)
-        .child(text("Size".to_string()).font(type_::BODY).color(soft()))
-        .child(scales)
-        .child(crop)
-        .child(row().gap(8.0).child(primary("export-go", "Export", confirm_export)).child(button(
-            "export-cancel-dialog".into(),
-            "Cancel".into(),
-            cancel_dialog,
-        )));
-    el().key("export-modal".to_string())
+                .justify_end()
+                .child(app::button("Cancel", Kind::Ghost, None, Some("Esc"), cancel_dialog).key("export-cancel-dialog"))
+                .child(app::button("Export", Kind::Primary, Some(&oc::DOWNLOAD), None, confirm_export).key("export-go")),
+        );
+    col()
+        .key("export-modal")
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
-        .fill(Color::BLACK.alpha(0.55))
-        .center()
-        .modal(true, cancel_dialog)
-        .child(card)
+        .fill(t.scrim)
+        .items_center()
+        .pt(app::DIALOG_TOP)
+        .child(panel.modal(true, cancel_dialog))
+        .on_background_press(cancel_dialog)
 }
-// ---------------------------------------------------------------- menu
-fn menu_view(s: &App) -> El {
-    let t = tok::theme(true);
 
-    // Camera section: camera combo, then the modes the camera really offers
-    let mut cams = section("Camera");
+// ---------------------------------------------------------------- menu
+fn menu_view(s: &App, layers: &mut Vec<El>) -> El {
+    let t = tokens();
+
+    // Camera section: camera, then the modes the camera really offers
+    let mut cams = col().w_full().gap(14.0).child(app::caption("Camera"));
     match s.cams.lock().map(|g| g.clone()).unwrap_or(CamList::Loading) {
-        CamList::Loading => {
-            cams = cams.child(text("Looking for cameras…".to_string()).font(type_::BODY).color(dim()));
-        }
-        CamList::Unavailable(e) => {
-            cams = cams.child(text(format!("Cameras unavailable: {e}")).font(type_::BODY).color(dim()));
-        }
-        CamList::Ready(list) if list.is_empty() => {
-            cams = cams.child(text("No camera found".to_string()).font(type_::BODY).color(dim()));
-        }
+        CamList::Loading => cams = cams.child(app::busy("Looking for cameras…")),
+        CamList::Unavailable(e) => cams = cams.child(message(&format!("Cameras unavailable: {e}"), Level::Err)),
+        CamList::Ready(list) if list.is_empty() => cams = cams.child(message("No camera found", Level::Warn)),
         CamList::Ready(list) => {
-            let name = list.iter().find(|(i, _)| Some(*i) == s.menu.cam).map_or("Select a camera".to_string(), |(_, n)| n.clone());
-            let items: Vec<(String, String)> = list.iter().map(|(i, n)| (i.to_string(), n.clone())).collect();
-            let selected = s.menu.cam.map(|i| i.to_string()).unwrap_or_default();
-            cams = cams.child(combo("cam-combo", name, move |_: &mut App, tx: &mut Tx| {
-                let menu = PopupMenu::picker(items.clone(), &selected);
-                tx.popup_menu(menu, "cam-combo", |s: &mut App, picked, _| {
-                    if let Some(i) = picked.and_then(|id| id.parse::<u32>().ok()) {
-                        if s.menu.cam != Some(i) {
-                            s.menu.cam = Some(i);
-                            s.menu.res = None;
-                            s.menu.format = None;
-                            s.menu.error = None;
-                            request_modes(s, i);
-                        }
+            let names: Vec<&str> = list.iter().map(|(_, n)| n.as_str()).collect();
+            let selected = list.iter().position(|(i, _)| Some(*i) == s.menu.cam).unwrap_or(0);
+            let ids: Vec<u32> = list.iter().map(|(i, _)| *i).collect();
+            let device = app::select(
+                "cam-select",
+                &names,
+                selected,
+                &s.cam_select,
+                |s: &mut App| &mut s.cam_select,
+                move |s: &mut App, k| {
+                    let Some(&i) = ids.get(k) else { return };
+                    if s.menu.cam != Some(i) {
+                        s.menu.cam = Some(i);
+                        s.menu.res = None;
+                        s.menu.format = None;
+                        s.menu.error = None;
+                        request_modes(s, i);
                     }
-                });
-            }));
+                },
+            )
+            .mount(layers);
+            cams = cams.child(app::field("Device", device));
 
             let (modes, note) = visible_modes(s);
-            if let Some(n) = note {
-                cams = cams.child(text(n).font(type_::BODY).color(dim()));
+            match (&modes, note) {
+                (None, Some(n)) => cams = cams.child(app::busy(&n)),
+                (Some(_), Some(n)) => cams = cams.child(message(&n, Level::Warn)),
+                _ => {}
             }
             if let Some(modes) = modes {
-                let title = |m: &Mode| format!("{} × {}  ·  up to {} fps", m.width, m.height, m.best_fps());
-                let current =
-                    modes.iter().find(|m| Some((m.width, m.height)) == s.menu.res).map_or("Select a resolution".to_string(), &title);
-                let res_items: Vec<(String, String)> = modes.iter().map(|m| (format!("{}x{}", m.width, m.height), title(m))).collect();
-                let res_selected = s.menu.res.map(|(w, h)| format!("{w}x{h}")).unwrap_or_default();
-                cams = cams.child(combo("res-combo", current, move |_: &mut App, tx: &mut Tx| {
-                    let menu = PopupMenu::picker(res_items.clone(), &res_selected);
-                    tx.popup_menu(menu, "res-combo", |s: &mut App, picked, _| {
-                        let parsed = picked.and_then(|id| {
-                            let (w, h) = id.split_once('x')?;
-                            Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
-                        });
-                        if let Some(r) = parsed {
+                let titles: Vec<String> = modes.iter().map(|m| format!("{} × {}  ·  {} fps", m.width, m.height, m.best_fps())).collect();
+                let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+                let sizes: Vec<(u32, u32)> = modes.iter().map(|m| (m.width, m.height)).collect();
+                let current = sizes.iter().position(|r| Some(*r) == s.menu.res).unwrap_or(0);
+                let resolution = app::select(
+                    "res-select",
+                    &refs,
+                    current,
+                    &s.res_select,
+                    |s: &mut App| &mut s.res_select,
+                    move |s: &mut App, k| {
+                        if let Some(&r) = sizes.get(k) {
                             s.menu.res = Some(r);
                             reconcile_modes(s);
                         }
-                    });
-                }));
+                    },
+                )
+                .mount(layers);
+                cams = cams.child(app::field("Resolution", resolution));
+
                 // Formats available at this resolution
-                let mut fmt = row().gap(8.0);
                 if let Some(mode) = modes.iter().find(|m| Some((m.width, m.height)) == s.menu.res) {
-                    for &(pf, fps) in &mode.formats {
-                        fmt = fmt.child(choice(
-                            format!("fmt-{}", pf.label()),
-                            format!("{} · {} fps", pf.label(), fps),
-                            s.menu.format == Some(pf),
-                            move |s: &mut App| s.menu.format = Some(pf),
-                        ));
-                    }
+                    let labels: Vec<String> = mode.formats.iter().map(|(pf, fps)| format!("{} · {fps} fps", pf.label())).collect();
+                    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    let pfs: Vec<PixelFormat> = mode.formats.iter().map(|f| f.0).collect();
+                    let chosen = pfs.iter().position(|pf| Some(*pf) == s.menu.format).unwrap_or(usize::MAX);
+                    let formats = app::segmented(&refs, chosen, move |s: &mut App, k| s.menu.format = pfs.get(k).copied());
+                    cams = cams.child(app::field("Pixel format", formats));
                 }
-                cams = cams.child(fmt).child(primary("start-cam", "Start camera", |s: &mut App| {
+
+                let start_cam = app::button("Start camera", Kind::Primary, Some(&oc::PHOTO), None, |s: &mut App| {
                     let Some(index) = s.menu.cam else {
                         s.menu.error = Some("Select a camera first".into());
                         return;
@@ -846,80 +815,103 @@ fn menu_view(s: &App) -> El {
                         .unwrap_or(30)
                         .clamp(1, 30);
                     start(s, SourceSpec::Camera { index, width, height, fps, format });
-                }));
+                })
+                .key("start-cam");
+                cams = cams.child(el().w_full().pt(4.0).child(wide(start_cam)));
             }
         }
     }
 
     // Save folder: every captured tile and every exported image goes there
-    let folder = section("Save folder")
+    let path = row()
+        .grow(1.0)
+        .min_w(0.0)
+        .h(app::h())
+        .px(app::d(10.0))
+        .gap(8.0)
+        .items_center()
+        .radius(app::R)
+        .fill(t.panel)
+        .border(1.0, t.line)
+        .child(icon(&oc::FOLDER, 13.0).color(t.dim))
+        .child(el().grow(1.0).min_w(0.0).child(text(s.menu.save_dir.display().to_string()).font(app::UI).color(t.text).truncate_head()));
+    let open = app::button("Open", Kind::Secondary, None, None, |s: &mut App| {
+        if let Err(e) = settings::open_folder(&s.menu.save_dir) {
+            s.menu.error = Some(e);
+        }
+    })
+    .key("open-folder");
+    let choose = button_tx("pick-folder", "Choose…", Kind::Secondary, None, |_: &mut App, tx: &mut Tx| {
+        let options = FileDialogOptions { title: "Choose the save folder".into(), ..Default::default() };
+        tx.open_folder(options, |s: &mut App, result, _tx| match result {
+            Ok(Some(path)) => {
+                settings::store_save_dir(&path);
+                s.menu.save_dir = path;
+            }
+            Ok(None) => {}
+            Err(e) => s.menu.error = Some(e.to_string()),
+        });
+    });
+    let folder = col()
+        .w_full()
+        .gap(10.0)
+        .child(app::caption("Save folder"))
         .child(
             text("Each session gets its own folder here, named after its date and time, with its tiles and exported mosaics.".to_string())
-                .font(type_::BODY)
-                .color(dim())
+                .font(app::UI)
+                .color(t.muted)
                 .w_full()
                 .wrap(),
         )
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .items_center()
-                .child(
-                    el().grow(1.0)
-                        .min_w(0.0)
-                        .child(text(s.menu.save_dir.display().to_string()).font(type_::BODY).color(soft()).truncate_head()),
-                )
-                .child(button("open-folder".into(), "Open".into(), |s: &mut App| {
-                    if let Err(e) = settings::open_folder(&s.menu.save_dir) {
-                        s.menu.error = Some(e);
-                    }
-                }))
-                .child(
-                    el().key("pick-folder".to_string())
-                        .role("button")
-                        .label("Choose folder".to_string())
-                        .focusable(true)
-                        .radius(8.0)
-                        .padding(8.0)
-                        .fill(hex("#24252b"))
-                        .on_press_tx(|_: &mut App, tx: &mut Tx| {
-                            let options = FileDialogOptions { title: "Choose the save folder".into(), ..Default::default() };
-                            tx.open_folder(options, |s: &mut App, result, _tx| match result {
-                                Ok(Some(path)) => {
-                                    settings::store_save_dir(&path);
-                                    s.menu.save_dir = path;
-                                }
-                                Ok(None) => {}
-                                Err(e) => s.menu.error = Some(e.to_string()),
-                            });
-                        })
-                        .child(text("Choose…".to_string()).font(type_::BODY).color(Color::WHITE)),
-                ),
-        );
+        .child(row().w_full().gap(8.0).items_center().child(path).child(open).child(choose));
 
-    let mut panel = col()
-        .w(520.0)
-        .gap(18.0)
+    let header = col().w_full().gap(6.0).child(text(APP_NAME.to_string()).font(ty::H3).color(t.text)).child(
+        text("Choose a camera, then slide the object under it row by row.".to_string()).font(app::UI).color(t.muted).w_full().wrap(),
+    );
+    let mut card = col()
+        .w(MENU_W)
+        .gap(22.0)
         .padding(28.0)
-        .radius(16.0)
-        .fill(card())
-        .child(text(APP_NAME.to_string()).font(type_::TITLE).color(Color::WHITE))
-        .child(text("Choose a camera, then slide the object under it row by row.".to_string()).font(type_::BODY).color(soft()))
+        .radius(14.0)
+        .fill(t.bg)
+        .border(1.0, t.line)
+        .child(header)
+        .child(hrule())
         .child(cams)
+        .child(hrule())
         .child(folder);
     if let Some(e) = &s.menu.error {
-        panel = panel.child(text(e.clone()).font(type_::BODY).color(red()));
+        card = card.child(message(e, Level::Err));
     }
-    col().w_full().h_full().center().gap(12.0).fill(t.bg).child(panel).child(el().w(520.0).child(version_link()))
-} // ---------------------------------------------------------------- running view
+    col().w_full().h_full().center().gap(14.0).fill(t.panel).child(card).child(el().w(MENU_W).child(version_link()))
+}
+
+// ---------------------------------------------------------------- running view
 fn state_color(st: CaptureState) -> Color {
+    let t = tokens();
     match st {
-        CaptureState::Tracking => soft(),
-        CaptureState::Stabilizing => amber(),
-        CaptureState::Capture => green(),
-        CaptureState::Move => blue(),
-        CaptureState::Lost => red(),
+        CaptureState::Tracking => t.text,
+        CaptureState::Stabilizing => t.warn,
+        CaptureState::Capture => t.ok,
+        CaptureState::Move => t.accent,
+        CaptureState::Lost => t.danger,
+    }
+}
+
+/// The capture state in a word, for the status bar.
+fn state_label(s: &App, r: &Report) -> (&'static str, Level) {
+    if s.paused {
+        return ("Paused", Level::Neutral);
+    }
+    if r.finished {
+        return ("Map complete", Level::Ok);
+    }
+    match r.state {
+        CaptureState::Tracking => ("Tracking", Level::Neutral),
+        CaptureState::Stabilizing => ("Holding still", Level::Warn),
+        CaptureState::Capture => ("Tile captured", Level::Ok),
+        CaptureState::Move => ("Moving", Level::Neutral),
+        CaptureState::Lost => ("Tracking lost", Level::Err),
     }
 }
 
@@ -966,12 +958,13 @@ fn next_step(s: &App, r: &Report) -> (String, String) {
 
 /// Colour of the instruction: guidance steps in amber, the map done in green, else the capture state.
 fn step_color(s: &App, r: &Report) -> Color {
+    let t = tokens();
     if s.paused {
-        dim()
+        t.muted
     } else if r.finished {
-        green()
+        t.ok
     } else if r.state != CaptureState::Lost && r.phase != Phase::Row {
-        amber()
+        t.warn
     } else {
         state_color(r.state)
     }
@@ -1032,38 +1025,49 @@ fn reticle(r: &Report, paused: bool) -> El {
     canvas(shape).size(RETICLE, RETICLE)
 }
 
+/// A translucent surface over the live image, readable on any picture.
+fn overlay(e: El) -> El {
+    let t = tokens();
+    e.fill(t.bg.alpha(0.8)).border(1.0, t.hair).radius(12.0)
+}
+
 fn live_overlay(s: &App) -> El {
     let Some(r) = &s.report else {
         return el();
     };
-    let chip = row().gap(12.0).child(text(next_step(s, r).0).font(type_::BODY).color(step_color(s, r)));
-    let hint = row().w_full().center().child(el().padding(10.0).radius(16.0).fill(chip_bg()).child(chip));
-    let stab = (r.stable_secs / 0.25).clamp(0.0, 1.0) as f32;
-    let sharp_color = if r.sharp_rel < 0.8 { red() } else { green() };
-    let bar = row()
+    let t = tokens();
+    let hint = row()
         .w_full()
-        .gap(18.0)
-        .padding(12.0)
-        .radius(12.0)
-        .fill(chip_bg())
-        .child(gauge(format!("Sharpness {:.0} %", r.sharp_rel * 100.0), r.sharp_rel, sharp_color, Some(0.8)))
-        .child(gauge(format!("Stability {:.0} ms", r.stable_secs * 1000.0), stab, amber(), None))
-        .child(gauge(format!("Offset {:.0} %", r.offset_frac * 100.0), r.offset_frac as f32, blue(), Some(0.65)))
+        .center()
+        .child(overlay(row().px(16.0).py(9.0)).child(text(next_step(s, r).0).font(app::TITLE).color(step_color(s, r))));
+    let stab = (r.stable_secs / 0.25).clamp(0.0, 1.0) as f32;
+    let sharp_color = if r.sharp_rel < 0.8 { t.danger } else { t.ok };
+    let bar = overlay(row().w_full().gap(22.0).px(16.0).py(12.0).items_center())
+        .child(gauge("Sharpness", format!("{:.0} %", r.sharp_rel * 100.0), r.sharp_rel, sharp_color, Some(0.8)))
+        .child(gauge("Stability", format!("{:.0} ms", r.stable_secs * 1000.0), stab, t.warn, None))
+        .child(gauge("Offset", format!("{:.0} %", r.offset_frac * 100.0), r.offset_frac as f32, t.accent, Some(0.65)))
         .child(spacer())
-        .child(text(count(r.tiles, "tile")).font(type_::TITLE).color(Color::WHITE));
-    col().absolute(0.0, 0.0).w_full().h_full().padding(12.0).child(hint).child(spacer()).child(bar)
+        .child(
+            row()
+                .gap(8.0)
+                .items_end()
+                .child(text(r.tiles.to_string()).font(app::FIGURE).color(t.text))
+                .child(text(if r.tiles == 1 { "TILE" } else { "TILES" }.to_string()).font(app::CAPTION).color(t.muted).pb(4.0)),
+        );
+    col().absolute(0.0, 0.0).w_full().h_full().padding(14.0).child(hint).child(spacer()).child(bar)
 }
 
 fn running_view(s: &App) -> El {
-    let t = tok::theme(true);
+    let t = tokens();
 
     // ---- Left: live image + overlays
     let mut live = el()
         .key("live".to_string())
         .grow(1.0)
+        .min_w(0.0)
         .h_full()
-        .radius(10.0)
-        .clip_rounded(10.0)
+        .radius(12.0)
+        .clip_rounded(12.0)
         .fill(Color::BLACK)
         .pixels_fit(&s.live, SurfaceFit::Fit);
     if let Some(r) = &s.report {
@@ -1071,9 +1075,12 @@ fn running_view(s: &App) -> El {
     }
     live = live.child(live_overlay(s));
     if let Some(msg) = &s.ended {
-        live = live.child(el().absolute(0.0, 60.0).w_full().center().child(
-            el().padding(10.0).radius(10.0).fill(chip_bg()).child(text(format!("Source stopped: {msg}")).font(type_::BODY).color(amber())),
-        ));
+        live = live.child(
+            el().absolute(0.0, 64.0)
+                .w_full()
+                .center()
+                .child(overlay(row().px(14.0).py(8.0).max_w(520.0)).child(message(&format!("Source stopped: {msg}"), Level::Warn))),
+        );
     }
 
     // ---- Right: side panel
@@ -1081,8 +1088,8 @@ fn running_view(s: &App) -> El {
         .key("mosaic".to_string())
         .w(MOSAIC_BOX.0)
         .h(MOSAIC_BOX.1)
-        .radius(10.0)
-        .clip_rounded(10.0)
+        .radius(app::R)
+        .clip_rounded(app::R)
         .fill(Color::BLACK)
         .pixels_fit(&s.mosaic, SurfaceFit::Fit);
     if let (Some(pv), Some(r)) = (&s.preview, &s.report) {
@@ -1093,10 +1100,14 @@ fn running_view(s: &App) -> El {
         let x = ox + (r.pos.0 - pv.origin.0) as f32 * sc;
         let y = oy + (r.pos.1 - pv.origin.1) as f32 * sc;
         let (w, h) = (r.frame_size.0 as f32 * sc, r.frame_size.1 as f32 * sc);
-        mosaic_box = mosaic_box.child(el().absolute(x, y).w(w).h(h).border(2.0, blue()));
+        mosaic_box = mosaic_box.child(el().absolute(x, y).w(w).h(h).border(2.0, t.accent));
     }
 
-    let mut panel = col().w(PANEL_W).h_full().gap(12.0).child(mosaic_box);
+    let tiles = s.report.as_ref().map_or(0, |r| r.tiles);
+    let finished = s.report.as_ref().is_some_and(|r| r.finished);
+    let badge = app::badge(&count(tiles, "tile"), if finished { Level::Ok } else { Level::Neutral });
+    let mut top = col().w_full().padding(14.0).gap(14.0).child(mosaic_box);
+    let mut details = None;
 
     if let Some(r) = &s.report {
         // What to do next, in words
@@ -1107,117 +1118,135 @@ fn running_view(s: &App) -> El {
         } else {
             format!("Row {} · {}", r.rows_done + 1, count(r.tiles, "tile"))
         };
-        panel = panel.child(
+        top = top.child(
             col()
                 .w_full()
                 .gap(6.0)
-                .padding(12.0)
-                .radius(10.0)
-                .fill(card())
-                .child(text(progress).font(type_::BODY).color(dim()))
-                .child(text(title).font(type_::TITLE).color(step_color(s, r)).w_full().wrap())
-                .child(text(detail).font(type_::BODY).color(soft()).w_full().wrap()),
+                .padding(14.0)
+                .radius(12.0)
+                .fill(t.tint)
+                .child(app::caption(&progress))
+                .child(text(title).font(ty::H4).color(step_color(s, r)).w_full().wrap())
+                .child(text(detail).font(app::UI).color(t.muted).w_full().wrap()),
         );
 
         // Collapsible details: measurements and rarely needed settings
-        let arrow = if s.details_open { "▾ Details" } else { "▸ Details" };
-        let mut details = col().w_full().gap(6.0).child(
-            el().key("details-toggle".to_string())
-                .role("button")
-                .label("Toggle details".to_string())
-                .focusable(true)
-                .on_press(|s: &mut App| s.details_open = !s.details_open)
-                .child(text(arrow.to_string()).font(type_::BODY).color(dim())),
+        let motion = r.motion.map_or("—".to_string(), |(dx, dy)| format!("{:.1} px", dx.hypot(dy)));
+        let body = col()
+            .w_full()
+            .gap(2.0)
+            .child(
+                el().w_full()
+                    .pb(8.0)
+                    .child(wide(app::button("Flip row direction", Kind::Secondary, Some(&oc::REFRESH), Some("R"), reverse).key("reverse"))),
+            )
+            .child(kv("Motion", motion))
+            .child(kv("Sharpness", format!("{:.0} %", r.sharp_rel * 100.0)))
+            .child(kv("Stability", format!("{:.0} ms", r.stable_secs * 1000.0)))
+            .child(kv("Offset from last tile", format!("{:.0} %", r.offset_frac * 100.0)))
+            .child(kv("Position", format!("{:.0}, {:.0} px", r.pos.0, r.pos.1)))
+            .child(kv("Analysis", format!("{:.1} ms", r.analysis_ms)))
+            .child(kv("Display", format!("{:.0} fps", s.fps)));
+        details = Some(
+            el().w_full()
+                .border_sides([1.0, 0.0, 0.0, 0.0], t.line)
+                .child(app::group("Details", s.details_open, |s: &mut App| s.details_open = !s.details_open, body).key("details")),
         );
-        if s.details_open {
-            let motion = r.motion.map_or("—".to_string(), |(dx, dy)| format!("{:.1} px", dx.hypot(dy)));
-            details = details
-                .child(button("reverse".into(), "Flip row direction (R)".into(), reverse))
-                .child(kv("Motion", motion))
-                .child(kv("Sharpness", format!("{:.0} %", r.sharp_rel * 100.0)))
-                .child(kv("Stability", format!("{:.0} ms", r.stable_secs * 1000.0)))
-                .child(kv("Offset from last tile", format!("{:.0} %", r.offset_frac * 100.0)))
-                .child(kv("Position", format!("{:.0}, {:.0} px", r.pos.0, r.pos.1)))
-                .child(kv("Analysis", format!("{:.1} ms", r.analysis_ms)))
-                .child(kv("Display", format!("{:.0} fps", s.fps)));
-        }
-        panel = panel.child(details);
     } else {
-        panel = panel.child(text("Opening source…".to_string()).font(type_::BODY).color(dim()));
+        top = top.child(app::busy("Opening source…"));
     }
 
     // Row and map ends are given by hand: "row ends here" while on a row, "mapping finished"
     // at any time once something is captured.
-    let mut guidance = col().w_full().gap(8.0);
+    let mut bottom = col().w_full().padding(14.0).gap(10.0).border_sides([1.0, 0.0, 0.0, 0.0], t.line);
     if let Some(r) = &s.report {
         if r.finished {
-            guidance = guidance.child(button("resume".into(), "Continue mapping (F)".into(), resume));
+            bottom = bottom.child(wide(app::button("Continue mapping", Kind::Secondary, None, Some("F"), resume).key("resume")));
         } else if r.tiles > 0 {
             if r.phase == Phase::Row {
-                guidance = guidance.child(button("end-row".into(), "Row ends here (E)".into(), end_row));
+                bottom = bottom.child(wide(app::button("Row ends here", Kind::Secondary, None, Some("E"), end_row).key("end-row")));
             }
             if r.phase != Phase::Closing(Then::Finish) {
-                guidance = guidance.child(primary("finish", "Mapping finished (F)", finish));
+                bottom =
+                    bottom.child(wide(app::button("Mapping finished", Kind::Primary, Some(&oc::CHECK), Some("F"), finish).key("finish")));
             }
         }
     }
-    panel = panel.child(spacer()).child(guidance).child(export_panel(s)).child(
-        col()
-            .w_full()
-            .gap(8.0)
-            .child(
-                row()
-                    .gap(8.0)
-                    .child(button("pause".into(), if s.paused { "Resume".into() } else { "Pause".into() }, toggle_pause))
-                    .child(button("undo".into(), "Undo last tile".into(), undo)),
-            )
-            .child(button("menu".into(), "Change source".into(), back_to_menu))
-            .child(version_link()),
+    let pause = if s.paused {
+        app::button("Resume", Kind::Secondary, None, Some("Space"), toggle_pause)
+    } else {
+        app::button("Pause", Kind::Secondary, None, Some("Space"), toggle_pause)
+    };
+    bottom = bottom.child(export_panel(s)).child(hrule()).child(
+        row().w_full().gap(8.0).child(pause.key("pause").grow(1.0).justify_center()).child(
+            app::button("Undo tile", Kind::Secondary, Some(&oc::OUTLINE_UNDO), Some("U"), undo).key("undo").grow(1.0).justify_center(),
+        ),
     );
+    bottom = bottom.child(wide(app::button("Change source", Kind::Ghost, Some(&oc::ARROW_LEFT), None, back_to_menu).key("menu")));
 
-    row().w_full().h_full().gap(12.0).padding(12.0).fill(t.bg).child(live).child(panel)
+    let mut side =
+        col().w(PANEL_W).h_full().fill(t.bg).border_sides([0.0, 0.0, 0.0, 1.0], t.line).child(app::pane_header("Mosaic", badge)).child(top);
+    if let Some(d) = details {
+        side = side.child(d);
+    }
+    side = side.child(spacer()).child(bottom);
+
+    // ---- Bottom: status bar
+    let mut left = Vec::new();
+    match &s.report {
+        Some(r) => {
+            let (label, level) = state_label(s, r);
+            left.push(app::status_item(Some(level), label));
+            left.push(app::status_item(None, &format!("Row {}", r.rows_done + 1)));
+            left.push(app::status_item(None, &format!("{:.0} fps", s.fps)));
+        }
+        None => left.push(app::status_item(Some(Level::Neutral), "Opening source")),
+    }
+    if s.export.is_some() {
+        left.push(app::status_item(Some(Level::Warn), "Exporting"));
+    }
+    let status = app::status_bar(left, vec![version_link()]);
+
+    let body = row().w_full().grow(1.0).min_h(0.0).child(row().grow(1.0).min_w(0.0).h_full().padding(12.0).child(live)).child(side);
+    col().w_full().h_full().fill(t.panel).child(body).child(status)
 }
 
 // ---------------------------------------------------------------- updates
 /// The version, pressed to look for a newer release.
 fn version_link() -> El {
+    let t = tokens();
     row()
         .key("version".to_string())
         .role("button")
         .label("Check for updates".to_string())
         .focusable(true)
-        .w_full()
+        .cursor(rune::Cursor::Pointer)
         .center()
+        .hover_group()
         .on_press_tx(|s: &mut App, tx: &mut Tx| {
             tx.instant();
             s.update_note = None;
             s.update_checking = true;
             s.updater.check(true);
         })
-        .child(text(format!("Mosaïx {} · check for updates", update::VERSION)).font(type_::BODY).color(dim()))
+        .child(text(format!("{APP_NAME} {} · check for updates", update::VERSION)).font(app::TINY).color(t.dim).group_color(t.text))
 }
 
 /// A button of the update bar. Its changes land at once: the bar showing, hiding or changing
 /// its text resizes the whole screen under it, which would otherwise spring and fade.
 fn bar_button(key: &str, label: &str, primary: bool, on_press: impl Fn(&mut App) + 'static) -> El {
-    el().key(key.to_string())
-        .role("button")
-        .label(label.to_string())
-        .focusable(true)
-        .radius(8.0)
-        .padding(8.0)
-        .fill(if primary { tok::accent(0, true) } else { hex("#24252b") })
-        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
-            tx.instant();
-            on_press(s);
-        })
-        .child(text(label.to_string()).font(type_::BODY).color(Color::WHITE))
+    let kind = if primary { Kind::Primary } else { Kind::Ghost };
+    button_tx(key, label, kind, None, move |s: &mut App, tx: &mut Tx| {
+        tx.instant();
+        on_press(s);
+    })
 }
 
 /// A bar across the top when a newer release exists (or during and after a check asked for by
 /// hand), with what can be done about it.
 fn update_banner(s: &App) -> Option<El> {
     use update::State;
+    let t = tokens();
     let open_page = |s: &mut App| {
         if let Some(url) = s.updater.page() {
             update::open_url(&url);
@@ -1229,65 +1258,74 @@ fn update_banner(s: &App) -> Option<El> {
             s.update_note = None;
         })
     };
-    let (message, buttons): (String, Vec<El>) = match (&s.update_note, &s.updater.state) {
-        (_, State::Checking) if s.update_checking => ("Checking for updates…".into(), Vec::new()),
-        (Some(note), State::Idle | State::Checking) => (note.clone(), vec![close()]),
+    let busy = || Some(app::spinner(12.0));
+    let dot = |l: Level| Some(app::dot(l));
+    let (lead, message, buttons): (Option<El>, String, Vec<El>) = match (&s.update_note, &s.updater.state) {
+        (_, State::Checking) if s.update_checking => (busy(), "Checking for updates…".into(), Vec::new()),
+        (Some(note), State::Idle | State::Checking) => (dot(Level::Neutral), note.clone(), vec![close()]),
         (_, State::Available(o)) if o.can_install() => (
-            format!("Mosaïx {} is available (you have {}).", o.release.version, update::VERSION),
+            dot(Level::Ok),
+            format!("{APP_NAME} {} is available (you have {}).", o.release.version, update::VERSION),
             vec![
-                bar_button("update-install", "Update now", true, |s: &mut App| s.updater.install()),
                 bar_button("update-page", "Release page", false, open_page),
                 close(),
+                bar_button("update-install", "Update now", true, |s: &mut App| s.updater.install()),
             ],
         ),
         (_, State::Available(o)) => (
-            format!("Mosaïx {} is available (you have {}). Download it from its release page.", o.release.version, update::VERSION),
-            vec![bar_button("update-page", "Open release page", true, open_page), close()],
+            dot(Level::Ok),
+            format!("{APP_NAME} {} is available (you have {}). Download it from its release page.", o.release.version, update::VERSION),
+            vec![close(), bar_button("update-page", "Open release page", true, open_page)],
         ),
         (_, State::Downloading { offer, done, total }) => {
             let pct = if *total > 0 { format!(" {} %", (done * 100 / total).min(100)) } else { String::new() };
-            (format!("Downloading Mosaïx {}…{pct}", offer.release.version), Vec::new())
+            (busy(), format!("Downloading {APP_NAME} {}…{pct}", offer.release.version), Vec::new())
         }
-        (_, State::Installing(offer)) => (format!("Installing Mosaïx {}… the app restarts by itself.", offer.release.version), Vec::new()),
+        (_, State::Installing(offer)) => {
+            (busy(), format!("Installing {APP_NAME} {}… the app restarts by itself.", offer.release.version), Vec::new())
+        }
         (_, State::Failed { offer, message }) => (
-            format!("Couldn't update to Mosaïx {}: {message}", offer.release.version),
-            vec![bar_button("update-page", "Open release page", true, open_page), close()],
+            dot(Level::Err),
+            format!("Couldn't update to {APP_NAME} {}: {message}", offer.release.version),
+            vec![close(), bar_button("update-page", "Open release page", true, open_page)],
         ),
         (None, State::Idle | State::Checking) => return None,
     };
-    Some(
-        row()
-            .key("update-banner".to_string())
-            .w_full()
-            .gap(8.0)
-            .padding(8.0)
-            .items_center()
-            .radius(10.0)
-            .fill(card())
-            .child(el().grow(1.0).min_w(0.0).child(text(message).font(type_::BODY).color(Color::WHITE).truncate()))
-            .children(buttons),
-    )
+    let mut bar = row()
+        .key("update-banner".to_string())
+        .w_full()
+        .gap(10.0)
+        .px(14.0)
+        .py(6.0)
+        .items_center()
+        .fill(t.bg)
+        .border_sides([0.0, 0.0, 1.0, 0.0], t.line);
+    if let Some(l) = lead {
+        bar = bar.child(l);
+    }
+    Some(bar.child(el().grow(1.0).min_w(0.0).child(text(message).font(app::UI).color(t.text).truncate())).children(buttons))
 }
 
 fn view(s: &App, _: &mut Cx<App>) -> El {
+    rune_basalt::set_theme(theme());
+    let t = tokens();
+    // Select lists, the export window: mounted over the window, above the page.
+    let mut layers = Vec::new();
     let main = match s.screen {
-        Screen::Menu => menu_view(s),
+        Screen::Menu => menu_view(s, &mut layers),
         Screen::Running => running_view(s),
     };
     // The screen keeps the same place in the tree whether the update bar or the export window
     // shows: moving it to another parent would remount it, and its live view would fade back in.
-    // The page carries the app's background, so the margin around the update bar isn't the
-    // window's black.
-    let mut page = col().key("page".to_string()).w_full().h_full().fill(tok::theme(true).bg);
+    let mut page = col().key("page".to_string()).w_full().h_full().fill(t.panel);
     if let Some(bar) = update_banner(s) {
-        page = page.child(el().key("update-slot".to_string()).w_full().padding(12.0).pb(0.0).child(bar));
+        page = page.child(el().key("update-slot".to_string()).w_full().child(bar));
     }
     page = page.child(el().key("screen".to_string()).w_full().grow(1.0).min_h(0.0).child(main));
-    let mut root = el().key("root".to_string()).w_full().h_full().child(page);
     if let Some(dir) = &s.export_dialog {
-        root = root.child(export_dialog_view(s, dir));
+        layers.push(export_dialog_view(s, dir));
     }
-    root
+    rune_kit::root(page, layers)
 }
 /// `--export <session_dir> <out> [--scale N] [--crop] [--no-refine]`: no window.
 fn cli_export(args: &[String]) -> Option<i32> {
@@ -1518,8 +1556,15 @@ fn main() {
     if let Err(e) = rune::set_app_icon(include_bytes!("../assets/icon/icon-macos.png").as_slice()) {
         eprintln!("mosaix: {e}");
     }
-    let spec =
-        AppSpec { setup: Some(setup), poll: Some(poll), on_key: Some(on_key), ..AppSpec::new(APP_NAME, (1280.0, 780.0), state, view) };
+    let spec = AppSpec {
+        setup: Some(setup),
+        poll: Some(poll),
+        on_key: Some(on_key),
+        fonts: rune_basalt::FONTS,
+        // Below this the side panel and the gauges over the live view no longer fit.
+        min_size: Some((1100.0, 700.0)),
+        ..AppSpec::new(APP_NAME, (1600.0, 960.0), state, view)
+    };
     // macOS: a standard titled window. Rune's default draws the content under a transparent
     // titlebar, so the traffic lights and the titlebar band would cover the top of the view.
     // Windows and Linux keep their native frame either way.

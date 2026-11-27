@@ -38,15 +38,15 @@ jobs:
             os: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A hand-run release builds the tag's code, not the branch it was started from.
+          ref: ${{ inputs.tag || github.ref }}
       # Basalt (the UI theme) is a submodule declared with an SSH URL: fetch it over HTTPS here.
       - name: Submodules
         shell: bash
         run: |
           git config --global url."https://github.com/".insteadOf "git@github.com:"
           git submodule update --init --recursive
-        with:
-          # A hand-run release builds the tag's code, not the branch it was started from.
-          ref: ${{ inputs.tag || github.ref }}
 
       # rust-toolchain.toml pins the compiler; rustup installs it on first use.
       - name: Rust toolchain
